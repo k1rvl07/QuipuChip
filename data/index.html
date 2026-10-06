@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="referrer" content="no-referrer" />
+  <title>PassManager</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:," />
+</head>
+
+<body>
+  <div id="app" class="app">
+    <header class="header">
+      <div class="container header__inner">
+        <h1 class="header__title">PassManager</h1>
+        <div class="header__controls" id="headerControls" hidden>
+          <button id="btnLock" class="btn btn--ghost" title="Заблокировать хранилище">Заблокировать</button>
+          <button id="btnReset" class="btn btn--danger-ghost" title="Полностью сбросить устройство">Сбросить</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="main container">
+      <!-- Экран: первичная настройка -->
+      <section id="screenSetup" class="screen" hidden>
+        <div class="card card--center">
+          <h2 class="card__title">Первичная настройка</h2>
+          <p class="card__text">Устройство ещё не настроено. Создайте хранилище — мастер-пароль будет сгенерирован
+            автоматически и показан один раз.</p>
+          <button id="btnProvision" class="btn btn--primary btn--lg">Создать хранилище</button>
+          <div id="setupStatus" class="status" hidden></div>
+        </div>
+
+        <div id="masterBlock" class="card" hidden>
+          <h3 class="card__subtitle">Мастер-пароль (покажите и сохраните)</h3>
+          <p class="card__warning">Этот пароль показывается <strong>только один раз</strong>. Утерян — восстановление
+            невозможно.</p>
+          <div class="password-field">
+            <textarea id="masterPassword" class="input input--mono input--password" rows="2" readonly
+              spellcheck="false"></textarea>
+            <div class="password-field__actions">
+              <button id="btnCopyMaster" class="btn btn--ghost btn--sm">Скопировать</button>
+              <button id="btnHideMaster" class="btn btn--ghost btn--sm">Скрыть/Показать</button>
+              <button id="btnDoneMaster" class="btn btn--primary btn--sm">Я сохранил пароль</button>
+            </div>
+          </div>
+          <p class="card__hint">Длина: <span id="masterLen">0</span> символов</p>
+        </div>
+      </section>
+
+      <!-- Экран: разблокировка -->
+      <section id="screenUnlock" class="screen" hidden>
+        <div class="card card--center">
+          <h2 class="card__title">Хранилище заблокировано</h2>
+          <p class="card__text">Введите мастер-пароль для разблокировки.</p>
+          <form id="formUnlock" class="form form--column">
+            <label class="label" for="inputUnlock">Мастер-пароль</label>
+            <input id="inputUnlock" type="password" class="input input--mono" autocomplete="current-password"
+              spellcheck="false" placeholder="••••••••••••••••••••••••••••••••••••••" />
+            <div class="form__actions">
+              <button id="btnUnlock" type="submit" class="btn btn--primary btn--lg">Разблокировать</button>
+            </div>
+          </form>
+          <div id="unlockStatus" class="status" hidden></div>
+          <div id="lockoutBlock" class="lockout" hidden>
+            <p class="lockout__text">Блокировка после неудачных попыток. Осталось: <span id="lockoutLeft">0</span> с</p>
+            <button id="btnUnlockRetry" class="btn btn--ghost btn--sm">Обновить</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Экран: основное приложение -->
+      <section id="screenApp" class="screen" hidden>
+        <div class="toolbar">
+          <div class="toolbar__left">
+            <input id="searchInput" type="search" class="input input--search" placeholder="Поиск по названию, логину, URL"
+              autocomplete="off" />
+          </div>
+          <div class="toolbar__right">
+            <button id="btnNew" class="btn btn--primary">Добавить запись</button>
+            <button id="btnRefresh" class="btn btn--ghost">Обновить</button>
+          </div>
+        </div>
+
+        <div id="entriesEmpty" class="empty" hidden>
+          <p>Записей пока нет</p>
+        </div>
+
+        <div id="entriesList" class="list"></div>
+
+        <div id="appStatus" class="status" hidden></div>
+      </section>
+
+      <!-- Модалка: создание/редактирование записи -->
+      <dialog id="modalEntry" class="modal">
+        <form method="dialog" id="formEntry" class="modal__content">
+          <header class="modal__header">
+            <h3 id="entryModalTitle" class="modal__title">Новая запись</h3>
+            <button type="button" id="btnEntryClose" class="btn btn--icon" title="Закрыть">✕</button>
+          </header>
+          <div class="modal__body">
+            <div class="form-grid">
+              <div class="form-field">
+                <label class="label" for="entryTitle">Название *</label>
+                <input id="entryTitle" type="text" class="input" autocomplete="off" spellcheck="false"
+                  placeholder="Например, Google" />
+              </div>
+              <div class="form-field">
+                <label class="label" for="entryLogin">Логин *</label>
+                <input id="entryLogin" type="text" class="input" autocomplete="username" spellcheck="false"
+                  placeholder="user@example.com" />
+              </div>
+              <div class="form-field form-field--password">
+                <label class="label" for="entryPassword">Пароль</label>
+                <div class="password-field">
+                  <input id="entryPassword" type="password" class="input input--mono" autocomplete="new-password"
+                    spellcheck="false" placeholder="Введите или сгенерируйте" />
+                  <div class="password-field__actions password-field__actions--inline">
+                    <button type="button" id="btnGenPass" class="btn btn--ghost btn--sm">Сгенерировать</button>
+                    <button type="button" id="btnTogglePass" class="btn btn--ghost btn--sm">Показать</button>
+                    <button type="button" id="btnCopyPass" class="btn btn--ghost btn--sm">Скопировать</button>
+                  </div>
+                </div>
+                <div class="generator" id="genOpts" hidden>
+                  <div class="generator__row">
+                    <label class="label label--inline">Длина: <span id="genLenVal">16</span></label>
+                    <input id="genLen" type="range" min="8" max="64" step="1" value="16" />
+                  </div>
+                  <div class="generator__row generator__checks">
+                    <label class="checkbox"><input type="checkbox" id="genUpper" checked /> Заглавные</label>
+                    <label class="checkbox"><input type="checkbox" id="genLower" checked /> Строчные</label>
+                    <label class="checkbox"><input type="checkbox" id="genDigits" checked /> Цифры</label>
+                    <label class="checkbox"><input type="checkbox" id="genSym" /> Символы</label>
+                  </div>
+                </div>
+              </div>
+              <div class="form-field">
+                <label class="label" for="entryUrl">URL</label>
+                <input id="entryUrl" type="url" class="input" spellcheck="false" placeholder="https://example.com" />
+              </div>
+              <div class="form-field form-field--full">
+                <label class="label" for="entryNote">Заметки</label>
+                <textarea id="entryNote" class="input" rows="3" spellcheck="false"
+                  placeholder="Дополнительная информация"></textarea>
+              </div>
+            </div>
+          </div>
+          <footer class="modal__footer">
+            <button type="button" id="btnEntryDelete" class="btn btn--danger" hidden>Удалить</button>
+            <div class="modal__spacer"></div>
+            <button type="button" id="btnEntryCancel" class="btn btn--ghost">Отмена</button>
+            <button type="submit" id="btnEntrySave" class="btn btn--primary">Сохранить</button>
+          </footer>
+        </form>
+      </dialog>
+
+      <!-- Модалка: сброс устройства -->
+      <dialog id="modalReset" class="modal">
+        <form method="dialog" id="formReset" class="modal__content">
+          <header class="modal__header">
+            <h3 class="modal__title">Сброс устройства</h3>
+            <button type="button" id="btnResetClose" class="btn btn--icon">✕</button>
+          </header>
+          <div class="modal__body">
+            <p class="card__warning">Это <strong>необратимая</strong> операция. Всё хранилище паролей будет удалено без
+              возможности восстановления.</p>
+            <p>Для подтверждения введите <strong>RESET</strong>.</p>
+            <input id="inputResetConfirm" type="text" class="input input--mono" autocomplete="off" spellcheck="false"
+              placeholder="RESET" />
+            <div id="resetStatus" class="status" hidden></div>
+          </div>
+          <footer class="modal__footer">
+            <button type="button" id="btnResetCancel" class="btn btn--ghost">Отмена</button>
+            <button type="submit" id="btnResetConfirm" class="btn btn--danger" disabled>Сбросить</button>
+          </footer>
+        </form>
+      </dialog>
+    </main>
+
+    <footer class="footer container">
+      <div class="footer__status">
+        <span id="statusLine">Инициализация...</span>
+      </div>
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+
+</html>
