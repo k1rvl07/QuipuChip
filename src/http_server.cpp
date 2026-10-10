@@ -16,6 +16,7 @@
 #include "logger.h"
 #include "net_bridge.h"
 #include "psram.h"
+#include "totp.h"
 #include "vault.h"
 
 namespace pm {
@@ -203,6 +204,8 @@ const char* jobKindName(auth::Job k) {
       return "unlock";
     case auth::Job::Reset:
       return "reset";
+    case auth::Job::Rekey:
+      return "rekey";
   }
   return "unknown";
 }
@@ -567,6 +570,140 @@ esp_err_t readJsonBody(httpd_req_t* r, JsonDocument& doc) {
   return ESP_OK;
 }
 
+// Значение символа base64 (RFC 4648) или -1. '=' здесь не decoded: padding
+// обрабатывается вызывающим, ему нужен только признак «валидный символ».
+int b64Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+// Строгий декодер base64 для поля keyfile: только стандартный алфавит, padding
+// ровно в последней группе и не более двух '='. Возвращаемое *outLen никогда не
+// превышает outMax, поэтому буфер вызывающего не переполняется ни при каком
+// входе.
+//
+// Ленивость к «нестандартному» base64 здесь была бы вредом, а не пользой:
+// присланный ключевой файл обязан быть байт-в-байт тем файлом, что хранился
+// при provisioning, и приём битого encoding'а дал бы молча неверный ключ.
+bool base64Decode(const char* s, size_t len, uint8_t* out, size_t outMax,
+                  size_t* outLen) {
+  if (len == 0 || (len % 4) != 0) {
+    return false;
+  }
+  size_t o = 0;
+  for (size_t i = 0; i < len; i += 4) {
+    const int a = b64Value(s[i]);
+    const int b = b64Value(s[i + 1]);
+    if (a < 0 || b < 0) {
+      return false;  // '=' в первых двух позициях тоже отсекается здесь
+    }
+    const bool cPad = (s[i + 2] == '=');
+    const bool dPad = (s[i + 3] == '=');
+    if ((cPad || dPad) && i + 4 != len) {
+      return false;  // padding только в последней группе
+    }
+    if (cPad && !dPad) {
+      return false;  // "xx=x" не бывает; допустимы только "xx==" и "xxx="
+    }
+    if (!cPad && b64Value(s[i + 2]) < 0) {
+      return false;
+    }
+    if (!dPad && b64Value(s[i + 3]) < 0) {
+      return false;
+    }
+    const int c = cPad ? 0 : b64Value(s[i + 2]);
+    const int d = dPad ? 0 : b64Value(s[i + 3]);
+    if (o >= outMax) {
+      return false;
+    }
+    out[o++] = static_cast<uint8_t>((a << 2) | (b >> 4));
+    if (cPad) {
+      break;  // "xx==" — ровно один выходной байт
+    }
+    if (o >= outMax) {
+      return false;
+    }
+    out[o++] = static_cast<uint8_t>(((b & 0x0F) << 4) | (c >> 2));
+    if (dPad) {
+      break;  // "xxx=" — ровно два выходных байта
+    }
+    if (o >= outMax) {
+      return false;
+    }
+    out[o++] = static_cast<uint8_t>(((c & 0x03) << 6) | d);
+  }
+  *outLen = o;
+  return true;
+}
+
+// Опциональное поле ключевого файла (base64) из уже разобранного тела запроса.
+// Имя поля — параметр: unlock/provision читают "keyfile", rekey читает
+// "keyfile_current" и "keyfile_new".
+//
+// Отсутствие поля и пустая строка означают «файла нет» — это штатное состояние
+// для хранилища без ключевого файла, а не ошибка. Наличие непустого, но
+// неверного значения — ошибка, уже отправленная клиенту.
+//
+// *out выделяется на kKeyFileMaxBytes (всегда столько, чтобы wipe() знал
+// фактический размер), вызывающий обязан crypto::wipe + free на ЛЮБОМ пути
+// после вызова, включая отказы дальше по коду. При ошибке буфер стирает и
+// освобождает сама эта функция.
+esp_err_t parseKeyfileField(httpd_req_t* r, JsonDocument& doc, const char* key,
+                            uint8_t** out, size_t* outLen) {
+  *out = nullptr;
+  *outLen = 0;
+  JsonVariant v = doc[key];
+  if (v.isNull()) {
+    return ESP_OK;
+  }
+  if (!v.is<const char*>()) {
+    return failJson(r, "400 Bad Request", "keyfile_not_a_string");
+  }
+  const char* b64 = v.as<const char*>();
+  const size_t n = strlen(b64);
+  if (n == 0) {
+    return ESP_OK;
+  }
+  if ((n % 4) != 0) {
+    return failJson(r, "400 Bad Request", "keyfile_invalid_base64");
+  }
+  // Верхняя граница декодированного размера: 3 байта на каждую группу из 4.
+  // Если она уже больше лимита, файл не влезает в хранилище независимо от
+  // padding'а — отказ до выделения и до декодирования.
+  if ((n / 4) * 3 > config::kKeyFileMaxBytes) {
+    return failJson(r, "400 Bad Request", "keyfile_too_large");
+  }
+  uint8_t* buf =
+      static_cast<uint8_t*>(heap_caps_malloc(config::kKeyFileMaxBytes, MALLOC_CAP_SPIRAM));
+  if (buf == nullptr) {
+    buf = static_cast<uint8_t*>(malloc(config::kKeyFileMaxBytes));
+  }
+  if (buf == nullptr) {
+    return failJson(r, "500 Internal Server Error", "out_of_memory");
+  }
+  size_t decoded = 0;
+  if (!base64Decode(b64, n, buf, config::kKeyFileMaxBytes, &decoded)) {
+    crypto::wipe(buf, config::kKeyFileMaxBytes);
+    free(buf);
+    return failJson(r, "400 Bad Request", "keyfile_invalid_base64");
+  }
+  if (decoded == 0) {
+    // Вырождение вида "====": валидный base64, но байтов нет. Приравниваем к
+    // «файла нет», а не к ошибке — иначе клиент, вычистивший поле, получил бы
+    // 400 на запрос без ключевого файла.
+    crypto::wipe(buf, config::kKeyFileMaxBytes);
+    free(buf);
+    return ESP_OK;
+  }
+  *out = buf;
+  *outLen = decoded;
+  return ESP_OK;
+}
+
 // Проверка сессии. 401 без различения причин: «нет токена», «не тот токен» и
 // «сессии нет» отвечают одинаково, иначе по коду ответа можно перебирать
 // действительные токены.
@@ -790,10 +927,15 @@ esp_err_t authStateHandler(httpd_req_t* r) {
   doc["busy"] = s.busy;
   doc["failCount"] = s.failCount;
   doc["lockoutMsLeft"] = s.lockoutMsLeft;
+  // Нужен ли файл для открытия: без этого признака UI не знал бы, что показать
+  // на форме unlock ДО ввода пароля. Читается с флеша без пароля, подделка
+  // флага вредит только подсказке — без самого файла ключ не выйдет.
+  doc["keyfileRequired"] = vault::keyFileRequired();
   // Поля конфигурации, нужные UI: иначе клиент дублирует эти числа у себя и
   // разойдётся с устройством при смене прошивки.
   doc["masterPasswordChars"] = static_cast<unsigned>(config::kMasterPasswordChars);
   doc["maxEntryCount"] = static_cast<unsigned>(config::kMaxEntries);
+  doc["keyFileMaxBytes"] = static_cast<unsigned>(config::kKeyFileMaxBytes);
   return sendDoc(r, doc, "auth_state");
 }
 
@@ -845,13 +987,35 @@ esp_err_t authProvisionHandler(httpd_req_t* r) {
     return failJson(r, "409 Conflict", "inconsistent_state");
   }
 
-  // Тело не читается: provisioning ничего не принимает. Читать его незачем, а
-  // пустой readJsonBody() заставил бы клиента отправлять "{}" без нужды.
-  if (r->content_len != 0) {
-    return failJson(r, "400 Bad Request", "unexpected_body");
+  // Тело опционально: пустое — provisioning без ключевого файла (штатный
+  // случай), непустое — только поле keyfile в base64. Прежний запрет тела был
+  // снят вместе с появлением файла: читать его целиком по-прежнему незачем.
+  uint8_t* keyFile = nullptr;
+  size_t keyFileLen = 0;
+  if (r->content_len > 0) {
+    JsonDocument doc;
+    const esp_err_t rd = readJsonBody(r, doc);
+    if (rd != ESP_OK) {
+      return rd;
+    }
+const esp_err_t kfe = parseKeyfileField(r, doc, "keyfile", &keyFile, &keyFileLen);
+    doc.clear();
+    if (kfe != ESP_OK) {
+      if (keyFile != nullptr) {
+        crypto::wipe(keyFile, config::kKeyFileMaxBytes);
+        free(keyFile);
+      }
+      return kfe;
+    }
   }
 
-  const auth::JobId id = auth::submitProvision();
+  const auth::JobId id = auth::submitProvision(keyFile, keyFileLen);
+  if (keyFile != nullptr) {
+    // Копия уже лежит в очереди воркера; локальная больше не нужна на любом
+    // пути — и при успехе, и при отказе.
+    crypto::wipe(keyFile, config::kKeyFileMaxBytes);
+    free(keyFile);
+  }
   if (id == auth::kNoJob) {
     return failJson(r, "503 Service Unavailable", "busy");
   }
@@ -893,13 +1057,30 @@ esp_err_t authUnlockHandler(httpd_req_t* r) {
   // куче до конца обработчика, а submitUnlock() копирует его ещё раз внутрь.
   char pwCopy[config::kMaxPassChars + 1];
   memcpy(pwCopy, pw, n + 1);
-  // Документ очищается сразу после копии: в куче ArduinoJson пароль остался бы
-  // лежать до конца обработчика. Очистка освобождает память, но вполне может
-  // НЕ занулить её, поэтому копия pwCopy стирается отдельно, уже после submit().
+
+  // Ключевой файл (base64) — опционально и ДО очистки документа: parse читает
+  // doc["keyfile"]. Отказ здесь возвращает пароль в кучу документа, поэтому
+  // pwCopy стирается перед возвратом.
+  uint8_t* keyFile = nullptr;
+  size_t keyFileLen = 0;
+  const esp_err_t kfe = parseKeyfileField(r, doc, "keyfile", &keyFile, &keyFileLen);
+  if (kfe != ESP_OK) {
+    crypto::wipe(pwCopy, sizeof(pwCopy));
+    return kfe;
+  }
+
+  // Документ очищается сразу после копий: в куче ArduinoJson пароль и файл
+  // остались бы лежать до конца обработчика. Очистка освобождает память, но
+  // вполне может НЕ занулить её, поэтому копии стираются отдельно, уже после
+  // submit().
   doc.clear();
 
-  const auth::JobId id = auth::submitUnlock(pwCopy);
+  const auth::JobId id = auth::submitUnlock(pwCopy, keyFile, keyFileLen);
   crypto::wipe(pwCopy, sizeof(pwCopy));
+  if (keyFile != nullptr) {
+    crypto::wipe(keyFile, config::kKeyFileMaxBytes);
+    free(keyFile);
+  }
   if (id == auth::kNoJob) {
     // Воркер занят ИЛИ идёт блокировка по неудачным попыткам: submit() отвергает
     // оба случая одинаково, чтобы не давать oracle по состоянию lockout.
@@ -1064,6 +1245,205 @@ esp_err_t authResetHandler(httpd_req_t* r) {
   // В лог уходит только факт запроса, без подтверждения и без содержимого.
   log::warn("http: vault reset requested, job %u", static_cast<unsigned>(id));
   return sendJobAccepted(r, id);
+}
+
+// POST /api/auth/rekey — смена мастер-пароля и/или ключевого файла.
+//
+// Старый мастер-пароль ОБЯЗАТЕЛЕН, а при включённом ключевом файле — и текущий
+// файл (keyfile_current): пара «пароль + файл» проверяется в воркере боевым
+// KDF (vault::begin) ДО самой смены ключа. Сессии для этого недостаточно — она
+// живёт в RAM, не переживает перезагрузку и доказывает лишь то, что устройство
+// когда-то открыли, а не текущее знание старого пароля.
+//
+// Тело (ключевые файлы — base64, ≤ kKeyFileMaxBytes):
+//   old_password     текущий мастер-пароль, обязателен
+//   password         новый мастер-пароль; отсутствие или "" = оставить прежним
+//   keyfile_current  текущий файл; обязателен, если он включён
+//   keyfile_action   "keep" | "set" | "clear" (по умолчанию "keep")
+//   keyfile_new      новый файл; обязателен при action="set"
+//
+// Сессия обязана проверяться: без неё любой, кто дотянулся до открытого
+// устройства по USB, мог бы сменить пароль на свой и увести данные у владельца.
+//
+// Ответ — 202 + поллинг /api/auth/job/{id}, как у unlock и reset: проверка
+// старого пароля и смена ключа — два полных круга PBKDF2, и это не укладывается
+// в один HTTP-запрос.
+esp_err_t authRekeyHandler(httpd_req_t* r) {
+  RequestGuard guard;
+  const esp_err_t g = requireSameOrigin(r);
+  if (g != ESP_OK) {
+    return g;
+  }
+  const esp_err_t s = requireSession(r);
+  if (s != ESP_OK) {
+    return s;
+  }
+
+  JsonDocument doc;
+  const esp_err_t rd = readJsonBody(r, doc);
+  if (rd != ESP_OK) {
+    return rd;
+  }
+
+  // Старый пароль: длина проверяется здесь, чтобы клиент узнал об ошибке сразу,
+  // а не после PBKDF2 в воркере.
+  const char* oldPw = doc["old_password"];
+  if (!oldPw || !doc["old_password"].is<const char*>()) {
+    return failJson(r, "400 Bad Request", "old_password_required");
+  }
+  const size_t oldLen = strlen(oldPw);
+  if (oldLen < config::kMinPassChars || oldLen >= config::kMaxPassChars) {
+    log::warn("http: rekey rejected, old password length %u out of range",
+              static_cast<unsigned>(oldLen));
+    return failJson(r, "400 Bad Request", "old_password_length_out_of_range");
+  }
+  char oldCopy[config::kMaxPassChars + 1];
+  memcpy(oldCopy, oldPw, oldLen + 1);
+
+  // Новый пароль опционален: пустое или отсутствующее поле означает «оставить
+  // прежним», воркер возьмёт oldPassword.
+  char newCopy[config::kMaxPassChars + 1] = {};
+  bool hasNewPassword = false;
+  const JsonVariant vNew = doc["password"];
+  if (!vNew.isNull()) {
+    if (!vNew.is<const char*>()) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      return failJson(r, "400 Bad Request", "password_not_a_string");
+    }
+    const char* np = vNew.as<const char*>();
+    const size_t n = strlen(np);
+    if (n > 0) {
+      if (n < config::kMinPassChars || n >= config::kMaxPassChars) {
+        crypto::wipe(oldCopy, sizeof(oldCopy));
+        return failJson(r, "400 Bad Request", "password_length_out_of_range");
+      }
+      memcpy(newCopy, np, n + 1);
+      hasNewPassword = true;
+    }
+  }
+
+  uint8_t* curFile = nullptr;
+  size_t curLen = 0;
+  uint8_t* newFile = nullptr;
+  size_t newLen = 0;
+
+  // Текущий файл требуется только когда он реально включён: на хранилище без
+  // файла поле бессмысленно, а воркер, получив непустой буфер, построил бы из
+  // него неверный материал и принял бы верный пароль за чужой.
+  const bool keyfileRequired = vault::keyFileRequired();
+  if (keyfileRequired) {
+    const esp_err_t kfe =
+        parseKeyfileField(r, doc, "keyfile_current", &curFile, &curLen);
+    if (kfe != ESP_OK) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      crypto::wipe(newCopy, sizeof(newCopy));
+      return kfe;
+    }
+    if (curFile == nullptr) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      crypto::wipe(newCopy, sizeof(newCopy));
+      return failJson(r, "400 Bad Request", "keyfile_current_required");
+    }
+  }
+
+  auth::KeyfileAction action = auth::KeyfileAction::Keep;
+  const JsonVariant vAct = doc["keyfile_action"];
+  if (!vAct.isNull()) {
+    if (!vAct.is<const char*>()) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      crypto::wipe(newCopy, sizeof(newCopy));
+      if (curFile != nullptr) {
+        crypto::wipe(curFile, config::kKeyFileMaxBytes);
+        free(curFile);
+      }
+      return failJson(r, "400 Bad Request", "keyfile_action_invalid");
+    }
+    const char* a = vAct.as<const char*>();
+    if (strcmp(a, "set") == 0) {
+      action = auth::KeyfileAction::Set;
+    } else if (strcmp(a, "clear") == 0) {
+      action = auth::KeyfileAction::Clear;
+    } else if (strcmp(a, "keep") != 0) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      crypto::wipe(newCopy, sizeof(newCopy));
+      if (curFile != nullptr) {
+        crypto::wipe(curFile, config::kKeyFileMaxBytes);
+        free(curFile);
+      }
+      return failJson(r, "400 Bad Request", "keyfile_action_invalid");
+    }
+  }
+  if (action == auth::KeyfileAction::Set) {
+    const esp_err_t kfe =
+        parseKeyfileField(r, doc, "keyfile_new", &newFile, &newLen);
+    if (kfe != ESP_OK) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      crypto::wipe(newCopy, sizeof(newCopy));
+      if (curFile != nullptr) {
+        crypto::wipe(curFile, config::kKeyFileMaxBytes);
+        free(curFile);
+      }
+      return kfe;
+    }
+    if (newFile == nullptr) {
+      crypto::wipe(oldCopy, sizeof(oldCopy));
+      crypto::wipe(newCopy, sizeof(newCopy));
+      if (curFile != nullptr) {
+        crypto::wipe(curFile, config::kKeyFileMaxBytes);
+        free(curFile);
+      }
+      return failJson(r, "400 Bad Request", "keyfile_new_required");
+    }
+  }
+  doc.clear();
+
+  const auth::JobId id =
+      auth::submitRekey(oldCopy, hasNewPassword ? newCopy : nullptr,
+                        curFile, curLen, newFile, newLen, action);
+  crypto::wipe(oldCopy, sizeof(oldCopy));
+  crypto::wipe(newCopy, sizeof(newCopy));
+  if (curFile != nullptr) {
+    crypto::wipe(curFile, config::kKeyFileMaxBytes);
+    free(curFile);
+  }
+  if (newFile != nullptr) {
+    crypto::wipe(newFile, config::kKeyFileMaxBytes);
+    free(newFile);
+  }
+  if (id == auth::kNoJob) {
+    return failJson(r, "503 Service Unavailable", "busy");
+  }
+  log::info("http: master password and/or keyfile change requested");
+  return sendJobAccepted(r, id);
+}
+
+// GET /api/auth/password — свежий кандидат мастер-пароля для UI.
+//
+// Отдаётся ИМЕННО кандидат, а не действующий пароль: действующий нигде не
+// хранится (после provisioning он живёт только в слоте job'а, пока клиент не
+// забрал его через poll). Назначение маршрута — экран смены пароля: словарь
+// лежит в прошивке, и без этого запроса UI не смог бы предложить пользователю
+// новую строку в том же формате, в каком её выдаёт provisioning.
+//
+// Каждый запрос даёт новый независимый кандидат, поэтому ответ не является
+// долгоживущим секретом устройства — но всё равно сидит под сессией, чтобы
+// посторонний не собирал строки генератора.
+esp_err_t authPasswordHandler(httpd_req_t* r) {
+  RequestGuard guard;
+  const esp_err_t s = requireSession(r);
+  if (s != ESP_OK) {
+    return s;
+  }
+  char pw[config::kMasterPasswordChars + 1];
+  (void)auth::generateMasterPassword(pw, sizeof(pw));
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["password"] = pw;
+  // sendDoc стирает свой буфер после отправки; локальную копию стираем сразу —
+  // она не нужна после постановки в документ.
+  const esp_err_t err = sendDoc(r, doc, "auth_password");
+  crypto::wipe(pw, sizeof(pw));
+  return err;
 }
 
 // ─── Entries API ──────────────────────────────────────────────────────────────
@@ -1234,6 +1614,13 @@ JsonObject o = arr.add<JsonObject>();
       tmp[0] = '\0';
       o["url"] = "";
     }
+    if (!setFieldBounded(o, "tags", e.tags, sizeof(e.tags), tmp, sizeof(tmp))) {
+      tmp[0] = '\0';
+      o["tags"] = "";
+    }
+    // Признак TOTP-секрета без самого секрета: значок в списке UI ставит по
+    // нему, не вытягивая карточку каждой записи.
+    o["hasTotp"] = (e.totp[0] != '\0');
   }
   xSemaphoreGive(g_entriesMux);
 
@@ -1248,7 +1635,12 @@ JsonObject o = arr.add<JsonObject>();
 // Проверка обязательна именно здесь: sizeof(e.title) = 48, а title из JSON может
 // быть любой длины до размера тела запроса. Копирование без проверки уронило бы
 // запись соседними полями — тихая порча хранилища вместо внятного 400.
-bool fillField(JsonDocument& doc, const char* key, char* dst, size_t dstSize) {
+//
+// Контейнер шаблонный: запись заполняется из JsonDocument (CRUD), батч импорта
+// — из JsonObject одной записи. Внутри obj[key] остаётся lvalue-выражением,
+// поэтому никакой ловушки с MemberProxy здесь нет (в отличие от setFieldBounded).
+template <typename TObject>
+bool fillField(TObject& doc, const char* key, char* dst, size_t dstSize) {
   JsonVariant v = doc[key];
   if (v.isNull()) {
     dst[0] = '\0';  // поле не прислано — это пустое поле, а не ошибка
@@ -1309,21 +1701,29 @@ esp_err_t entriesWriteHandler(httpd_req_t* r) {
       !fillField(doc, "login", e.login, sizeof(e.login)) ||
       !fillField(doc, "password", e.password, sizeof(e.password)) ||
       !fillField(doc, "url", e.url, sizeof(e.url)) ||
-      !fillField(doc, "note", e.note, sizeof(e.note))) {
+      !fillField(doc, "note", e.note, sizeof(e.note)) ||
+      !fillField(doc, "tags", e.tags, sizeof(e.tags)) ||
+      !fillField(doc, "totp", e.totp, sizeof(e.totp))) {
     // Пароль в документе остаётся в куче — стираем через clear() ниже. Само тело
     // уже стёрто в readJsonBody().
     doc.clear();
     return failJson(r, "400 Bad Request", "field_too_long_or_not_a_string");
   }
 
-  // Запись обязана быть хоть как-то опознаваемой: без заголовка и логина её
-  // невозможно найти в списке, и она бесполезна. Пароль без заголовка —
-  // наоборот, обычное дело (логин может быть пустым).
-  if (e.title[0] == '\0' && e.login[0] == '\0') {
+  // Секрет проверяется при записи, а не при выдаче кода: битый base32 в
+  // хранилище — это ошибка, которую пользователь должен увидеть в момент ввода,
+  // а не позже, когда карточка уже сохранена и поле выглядит заполненным.
+  // Пустое поле допустимо — это запись без TOTP.
+  if (e.totp[0] != '\0' && !totp::validSecret(e.totp)) {
     crypto::wipe(&e, sizeof(e));
     doc.clear();
-    return failJson(r, "400 Bad Request", "title_or_login_required");
+    return failJson(r, "400 Bad Request", "totp_secret_invalid");
   }
+
+  // Проверки «запись обязана иметь title или login» больше нет: пустые по
+  // обеим полям записи приходят при импорте KDBX-выгрузок и не должны
+  // отвергаться на уровне API — искать их в списке UI может по любому из
+  // оставшихся полей, а запрет бил бы именно по импорту.
 
   // Запись, которая пригодится для слияния пароля. Держится до конца add():
   // стирать её раньше нельзя, crypto::wipe(&e) ниже её затрёт.
@@ -1394,19 +1794,33 @@ esp_err_t entriesWriteHandler(httpd_req_t* r) {
 
 esp_err_t entriesDetailHandler(httpd_req_t* r);
 esp_err_t entriesSecretHandler(httpd_req_t* r);
+esp_err_t entriesTotpHandler(httpd_req_t* r);
 
-// GET /api/entries/* — один обработчик на карточку и на выдачу пароля.
+// GET /api/entries/* — один обработчик на карточку, выдачу пароля и код TOTP.
 //
-// Разводить их в два шаблона нельзя: httpd_uri_match_wildcard() в IDF 4.4
+// Разводить их в три шаблона нельзя: httpd_uri_match_wildcard() в IDF 4.4
 // понимает '*' только как хвостовой подстановочный знак, и шаблон с '*' в
-// середине не совпадёт ни с одним путём. Поэтому суффикс "/secret" разбирается
-// вручную здесь.
+// середине не совпадёт ни с одним путём. Поэтому суффиксы "/secret" и "/totp"
+// разбираются вручную здесь.
+//
+// Суффиксы сверяются с ПУТЁМ без query-строки: "/totp?t=123" заканчивается на
+// значение параметра, а не на "/totp", и сравнение по полному URI не совпало бы
+// никогда.
 esp_err_t entriesGetHandler(httpd_req_t* r) {
+  const char* q = strchr(r->uri, '?');
+  const size_t pathLen = (q != nullptr) ? static_cast<size_t>(q - r->uri)
+                                        : strlen(r->uri);
   static const char kSecretSuffix[] = "/secret";
-  const size_t sufLen = sizeof(kSecretSuffix) - 1;
-  const size_t uriLen = strlen(r->uri);
-  if (uriLen > sufLen && strcmp(r->uri + uriLen - sufLen, kSecretSuffix) == 0) {
+  static const char kTotpSuffix[] = "/totp";
+  constexpr size_t kSecretLen = sizeof(kSecretSuffix) - 1;
+  constexpr size_t kTotpLen = sizeof(kTotpSuffix) - 1;
+  if (pathLen > kSecretLen &&
+      memcmp(r->uri + pathLen - kSecretLen, kSecretSuffix, kSecretLen) == 0) {
     return entriesSecretHandler(r);
+  }
+  if (pathLen > kTotpLen &&
+      memcmp(r->uri + pathLen - kTotpLen, kTotpSuffix, kTotpLen) == 0) {
+    return entriesTotpHandler(r);
   }
   return entriesDetailHandler(r);
 }
@@ -1437,6 +1851,12 @@ esp_err_t entriesDetailHandler(httpd_req_t* r) {
   // Пароль в detail НЕ отдаётся: для этого есть отдельный /secret. Список и
   // карточка — то, что UI держит открытыми постоянно, и тащить туда секрет
   // значило бы держать его в памяти вкладки без нужды.
+  //
+  // TOTP-секрет в detail отдаётся, в отличие от пароля: он нужен для
+  // редактирования (иначе любая правка записи стёрла бы его, как стирает
+  // сегодня неприсланный url), а на руках он только у того, у кого уже есть
+  // сессия. Код при этом отдельно отдаёт только /totp — так UI не считает
+  // коды сам и не держит секрет дольше одной карточки.
   JsonDocument doc;
   doc["ok"] = true;
   doc["id"] = e.id;
@@ -1447,6 +1867,8 @@ esp_err_t entriesDetailHandler(httpd_req_t* r) {
   clean = setFieldBounded(doc, "login", e.login, sizeof(e.login), tmp, sizeof(tmp)) && clean;
   clean = setFieldBounded(doc, "url", e.url, sizeof(e.url), tmp, sizeof(tmp)) && clean;
   clean = setFieldBounded(doc, "note", e.note, sizeof(e.note), tmp, sizeof(tmp)) && clean;
+  clean = setFieldBounded(doc, "tags", e.tags, sizeof(e.tags), tmp, sizeof(tmp)) && clean;
+  clean = setFieldBounded(doc, "totp", e.totp, sizeof(e.totp), tmp, sizeof(tmp)) && clean;
   if (!clean) {
     // Поле без нуль-байта во всю свою длину: обрезать молча нельзя, поле в JSON
     // было бы битым. Само значение уходит в лог только как длина, не содержимое.
@@ -1455,6 +1877,7 @@ esp_err_t entriesDetailHandler(httpd_req_t* r) {
     return failJson(r, "500 Internal Server Error", "entry_field_unterminated");
   }
   doc["hasPassword"] = (e.password[0] != '\0');
+  doc["hasTotp"] = (e.totp[0] != '\0');
   const esp_err_t err = sendDoc(r, doc, "entry_detail");
   crypto::wipe(&e, sizeof(e));
   return err;
@@ -1535,6 +1958,130 @@ esp_err_t entriesSecretHandler(httpd_req_t* r) {
   return err;
 }
 
+// Разбор query-строки вида "t=1712345678&..." — только параметр t, строго
+// десятичные цифры до '&'. Прочие параметры молча пропускаются: их наличие не
+// делает запрос некорректным, а незнакомые параметры парсеров ломают клиенты
+// при каждом расширении API.
+bool queryTime(const char* uri, uint32_t* out) {
+  const char* q = strchr(uri, '?');
+  if (q == nullptr) {
+    return false;
+  }
+  const char* p = q + 1;
+  while (*p != '\0') {
+    const char* amp = strchr(p, '&');
+    const size_t len = (amp != nullptr) ? static_cast<size_t>(amp - p) : strlen(p);
+    if (len > 2 && p[0] == 't' && p[1] == '=') {
+      uint32_t v = 0;
+      for (size_t i = 2; i < len; ++i) {
+        if (p[i] < '0' || p[i] > '9') {
+          return false;
+        }
+        const uint32_t digit = static_cast<uint32_t>(p[i] - '0');
+        if (v > (UINT32_MAX - digit) / 10) {
+          return false;  // переполнение 32 бит: время вне досягаемости
+        }
+        v = v * 10 + digit;
+      }
+      *out = v;
+      return true;
+    }
+    if (amp == nullptr) {
+      break;
+    }
+    p = amp + 1;
+  }
+  return false;
+}
+
+// GET /api/entries/{id}/totp?t=<epoch-seconds>
+//
+// Время приходит СНАРУЖИ: на плате нет ни RTC, ни NTP, и устройство не может
+// само отличить настоящую эпоху от прошлогодней. Клиент шлёт свои часы, сервер
+// считает код из секрета, который покидает устройство только в виде готовых
+// 6 цифр. Это осознанный обмен: подделать время способен только тот, у кого
+// уже есть сессия, а вред от подделанного кода — показать пользователю не ту
+// цифру, не давая ничего взамен.
+esp_err_t entriesTotpHandler(httpd_req_t* r) {
+  RequestGuard guard;
+  const esp_err_t s = requireSession(r);
+  if (s != ESP_OK) {
+    return s;
+  }
+
+  // Путь без query — для разбора id: pathId() отверг бы "?t=..." как
+  // нечисловой хвост.
+  char base[config::kHttpMaxUri + 1];
+  const char* q = strchr(r->uri, '?');
+  const size_t pathLen =
+      (q != nullptr) ? static_cast<size_t>(q - r->uri) : strlen(r->uri);
+  if (pathLen >= sizeof(base)) {
+    return failJson(r, "400 Bad Request", "bad_entry_id");
+  }
+  memcpy(base, r->uri, pathLen);
+  base[pathLen] = '\0';
+
+  // Суффикс "/totp" отрезается ДО разбора id — иначе pathId() увидел бы в
+  // хвосте "1/totp" и отверг бы путь как нечисловой, то есть каждый запрос
+  // кода возвращал бы bad_entry_id (тот же приём, что в entriesSecretHandler).
+  // Сверка строгая: "/api/entries/7/totpx" не пройдёт.
+  static const char kSuffix[] = "/totp";
+  const size_t sufLen = sizeof(kSuffix) - 1;
+  if (pathLen <= sufLen || memcmp(base + pathLen - sufLen, kSuffix, sufLen) != 0) {
+    return failJson(r, "400 Bad Request", "bad_entry_id");
+  }
+  base[pathLen - sufLen] = '\0';
+
+  uint32_t id = 0;
+  if (!pathId(base, "/api/entries/", &id)) {
+    return failJson(r, "400 Bad Request", "bad_entry_id");
+  }
+
+  uint32_t when = 0;
+  if (!queryTime(r->uri, &when)) {
+    return failJson(r, "400 Bad Request", "time_required");
+  }
+
+  vault::Entry e = {};
+  const vault::VaultError rc = vault::get(id, &e);
+  if (rc == vault::VaultError::NotFound) {
+    return failJson(r, "404 Not Found", "entry_not_found");
+  }
+  if (rc != vault::VaultError::Ok) {
+    crypto::wipe(&e, sizeof(e));
+    log::error("http: vault::get failed %s", vault::toString(rc));
+    return failJson(r, "500 Internal Server Error", "vault_get_failed");
+  }
+
+  if (e.totp[0] == '\0') {
+    crypto::wipe(&e, sizeof(e));
+    return failJson(r, "409 Conflict", "totp_not_configured");
+  }
+
+  char code[7] = {};
+  const bool ok = totp::code(e.totp, when, code);
+  // Секрет в записи уже прошёл проверку при записи, поэтому отказ здесь —
+  // порча хранилища, а не ошибка пользователя.
+  if (!ok) {
+    crypto::wipe(&e, sizeof(e));
+    log::error("http: entry %u totp secret unusable", static_cast<unsigned>(id));
+    return failJson(r, "500 Internal Server Error", "totp_secret_invalid");
+  }
+  // Секрет стирается ДО формирования ответа: в документ попадают только
+  // готовый код и цифры жизненного цикла.
+  crypto::wipe(&e, sizeof(e));
+
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["code"] = code;
+  doc["periodSec"] = static_cast<unsigned>(config::kTotpPeriodSec);
+  doc["expiresInSec"] =
+      static_cast<unsigned>(config::kTotpPeriodSec - (when % config::kTotpPeriodSec));
+  const esp_err_t err = sendDoc(r, doc, "entry_totp");
+  crypto::wipe(code, sizeof(code));
+  return err;
+}
+
 // DELETE /api/entries/{id}
 esp_err_t entriesDeleteHandler(httpd_req_t* r) {
   RequestGuard guard;
@@ -1587,6 +2134,272 @@ esp_err_t entriesDeleteHandler(httpd_req_t* r) {
   doc["ok"] = true;
   doc["id"] = id;
   return sendDoc(r, doc, "entry_delete");
+}
+
+// ─── Export / Import API (PMX1) ───────────────────────────────────────────────
+
+// GET /api/export — выгрузка всего хранилища в PMX1.
+//
+// Формат: {"ok":true,"format":"PMX1","version":1,"count":N,"entries":[...]}.
+// id НЕ выгружается: при импорте он переназначается, и сохранять чужой было бы
+// ложной стабильностью — два устройства выдали бы разные судьбы одной записи.
+// Все семь строковых полей, включая пароль и TOTP-секрет: это выгрузка под
+// сессией, и именно ради неё пользователь и открывает сессию.
+//
+// Отдаётся по частям, а НЕ одним sendDocStreamed: при тысяче записей документ
+// порядка мегабайта, а sendDocStreamed делает один malloc на весь документ.
+// Здесь буфер на одну запись (~1.5 КБ), поэтому размер хранилища не влияет на
+// исход.
+//
+// Начатый chunked-ответ ошибкой дописать нельзя — заголовки уже ушли. При
+// обрыве на середине клиент получает обрезанный JSON и падает на его разборе,
+// что и является сигналом «выгрузка неполна».
+esp_err_t exportHandler(httpd_req_t* r) {
+  RequestGuard guard;
+  const esp_err_t s = requireSession(r);
+  if (s != ESP_OK) {
+    return s;
+  }
+
+  uint32_t maxCount = 0;
+  vault::Entry* buf = entriesBuffer(&maxCount);
+  if (buf == nullptr) {
+    return failJson(r, "500 Internal Server Error", "entries_buffer_unavailable");
+  }
+  if (xSemaphoreTake(g_entriesMux, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    return failJson(r, "503 Service Unavailable", "entries_busy");
+  }
+
+  uint32_t count = 0;
+  const vault::VaultError rc = vault::load(buf, maxCount, &count);
+  if (rc != vault::VaultError::Ok) {
+    xSemaphoreGive(g_entriesMux);
+    log::error("http: vault::load failed %s", vault::toString(rc));
+    return failJson(r, "500 Internal Server Error", "vault_load_failed");
+  }
+
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(r, "X-Content-Type-Options", "nosniff");
+  // Ответ — полный архив паролей: браузер не должен оставить его в кэше и
+  // отдать следующей вкладке после закрытия.
+  httpd_resp_set_hdr(r, "Content-Disposition",
+                     "attachment; filename=\"passmanager-export.json\"");
+
+  char head[96];
+  const int hn = snprintf(head, sizeof(head),
+                          "{\"ok\":true,\"format\":\"PMX1\",\"version\":%u,\"count\":%u,"
+                          "\"entries\":[",
+                          static_cast<unsigned>(config::kExportVersion),
+                          static_cast<unsigned>(count));
+  if (hn <= 0 || static_cast<size_t>(hn) >= sizeof(head)) {
+    xSemaphoreGive(g_entriesMux);
+    return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "export header overflow");
+  }
+  esp_err_t err = httpd_resp_send_chunk(r, head, hn);
+
+  // По одной записи в чанк. Мьютекс держится до конца: буфер общий, и список,
+  // начатый параллельно, увидел бы смешанное состояние.
+  for (uint32_t i = 0; err == ESP_OK && i < count; ++i) {
+    const vault::Entry& e = buf[i];
+    JsonDocument ed;
+    JsonObject o = ed.to<JsonObject>();
+    // По наибольшему среди всех семи полей — note (400 Б): один tmp на все.
+    char tmp[sizeof(vault::Entry::note) + 1];
+    const bool clean =
+        setFieldBounded(o, "title", e.title, sizeof(e.title), tmp, sizeof(tmp)) &&
+        setFieldBounded(o, "login", e.login, sizeof(e.login), tmp, sizeof(tmp)) &&
+        setFieldBounded(o, "password", e.password, sizeof(e.password), tmp, sizeof(tmp)) &&
+        setFieldBounded(o, "url", e.url, sizeof(e.url), tmp, sizeof(tmp)) &&
+        setFieldBounded(o, "note", e.note, sizeof(e.note), tmp, sizeof(tmp)) &&
+        setFieldBounded(o, "tags", e.tags, sizeof(e.tags), tmp, sizeof(tmp)) &&
+        setFieldBounded(o, "totp", e.totp, sizeof(e.totp), tmp, sizeof(tmp));
+    if (!clean) {
+      log::error("http: export aborted, entry %u has unterminated field",
+                 static_cast<unsigned>(e.id));
+      break;  // обрезанный JSON — честный сигнал клиенту
+    }
+    const int n = measureJson(ed);
+    char* item = static_cast<char*>(malloc(static_cast<size_t>(n) + 2));  // + запятая
+    if (item == nullptr) {
+      log::error("http: export aborted, item alloc failed for %d bytes", n);
+      break;
+    }
+    size_t pos = 0;
+    if (i > 0) {
+      item[pos++] = ',';
+    }
+    const size_t wrote = serializeJson(ed, item + pos, static_cast<size_t>(n) + 1);
+    if (wrote == 0) {
+      log::error("http: export aborted, entry %u did not serialize", static_cast<unsigned>(e.id));
+      free(item);
+      break;
+    }
+    err = httpd_resp_send_chunk(r, item, pos + wrote);
+    // Строки здесь — не пароли в чистом виде (уже отправлены клиенту), но и
+    // их стирать не вредно: буфер освобождается сразу.
+    crypto::wipe(item, pos + wrote);
+    free(item);
+  }
+
+  if (err == ESP_OK) {
+    static const char kTail[] = "]}";
+    err = httpd_resp_send_chunk(r, kTail, sizeof(kTail) - 1);
+  }
+  if (err == ESP_OK) {
+    err = httpd_resp_send_chunk(r, nullptr, 0);
+  }
+  xSemaphoreGive(g_entriesMux);
+  if (err == ESP_OK) {
+    log::info("http: exported %u entries", static_cast<unsigned>(count));
+  }
+  return err;
+}
+
+// POST /api/import — приём одного батча PMX1.
+//
+// Целый экспорт в один запрос не влезает в kHttpMaxBody (8 КБ), поэтому клиент
+// режет его на батчи по config::kImportBatchEntries записей. Формат батча —
+// тот же, что у выгрузки, минус ok/count.
+//
+// Атомарность намеренно ограниченная: валидация ВСЕХ записей батча идёт до
+// первого add(), то есть ошибка формата не оставляет половины батча. Сбой на
+// самом add() (переполнение хранилища) оставляет добавленное и сообщает
+// imported — откатывать чужие удачные записи ради чужой неудачной нельзя.
+//
+// id из тела игнорируется: назначает устройство, иначе импорт двух выгрузок
+// сошёлся бы по чужим номерам.
+esp_err_t importHandler(httpd_req_t* r) {
+  RequestGuard guard;
+  const esp_err_t g = requireSameOrigin(r);
+  if (g != ESP_OK) {
+    return g;
+  }
+  const esp_err_t s = requireSession(r);
+  if (s != ESP_OK) {
+    return s;
+  }
+
+  JsonDocument doc;
+  const esp_err_t rd = readJsonBody(r, doc);
+  if (rd != ESP_OK) {
+    return rd;
+  }
+
+  const char* format = doc["format"];
+  if (!format || !doc["format"].is<const char*>() ||
+      strcmp(format, "PMX1") != 0) {
+    doc.clear();
+    return failJson(r, "400 Bad Request", "format_required");
+  }
+  if (!doc["version"].is<unsigned>() ||
+      doc["version"].as<unsigned>() != config::kExportVersion) {
+    doc.clear();
+    return failJson(r, "400 Bad Request", "version_unsupported");
+  }
+  JsonArray arr = doc["entries"].as<JsonArray>();
+  if (arr.isNull()) {
+    doc.clear();
+    return failJson(r, "400 Bad Request", "entries_required");
+  }
+  const size_t count = arr.size();
+  if (count == 0) {
+    doc.clear();
+    return failJson(r, "400 Bad Request", "nothing_to_import");
+  }
+  if (count > config::kImportBatchEntries) {
+    doc.clear();
+    return failJson(r, "400 Bad Request", "batch_too_large");
+  }
+
+  vault::Entry* batch = static_cast<vault::Entry*>(
+      heap_caps_malloc(count * sizeof(vault::Entry), MALLOC_CAP_SPIRAM));
+  if (batch == nullptr) {
+    batch = static_cast<vault::Entry*>(malloc(count * sizeof(vault::Entry)));
+  }
+  if (batch == nullptr) {
+    doc.clear();
+    return failJson(r, "500 Internal Server Error", "out_of_memory");
+  }
+  memset(batch, 0, count * sizeof(vault::Entry));
+
+  // Отказ в фазе валидации: ни одна запись батча ещё не добавлена, батч
+  // стирается и освобождается целиком.
+  auto failBatch = [&](const char* code) -> esp_err_t {
+    crypto::wipe(batch, count * sizeof(vault::Entry));
+    free(batch);
+    doc.clear();
+    return failJson(r, "400 Bad Request", code);
+  };
+
+  for (size_t i = 0; i < count; ++i) {
+    JsonObject o = arr[i].as<JsonObject>();
+    if (o.isNull()) {
+      return failBatch("entry_not_an_object");
+    }
+    vault::Entry& e = batch[i];
+    if (!fillField(o, "title", e.title, sizeof(e.title)) ||
+        !fillField(o, "login", e.login, sizeof(e.login)) ||
+        !fillField(o, "password", e.password, sizeof(e.password)) ||
+        !fillField(o, "url", e.url, sizeof(e.url)) ||
+        !fillField(o, "note", e.note, sizeof(e.note)) ||
+        !fillField(o, "tags", e.tags, sizeof(e.tags)) ||
+        !fillField(o, "totp", e.totp, sizeof(e.totp))) {
+      return failBatch("field_too_long_or_not_a_string");
+    }
+    if (e.totp[0] != '\0' && !totp::validSecret(e.totp)) {
+      return failBatch("totp_secret_invalid");
+    }
+  }
+
+  uint32_t added = 0;
+  vault::VaultError rc = vault::VaultError::Ok;
+  for (; added < count; ++added) {
+    rc = vault::add(batch[added], nullptr);
+    if (rc != vault::VaultError::Ok) {
+      break;
+    }
+  }
+  crypto::wipe(batch, count * sizeof(vault::Entry));
+  free(batch);
+  doc.clear();
+
+  JsonDocument out;
+  if (rc != vault::VaultError::Ok) {
+    const char* status = "500 Internal Server Error";
+    const char* code = "vault_add_failed";
+    switch (rc) {
+      case vault::VaultError::TooManyEntries:
+        status = "409 Conflict";
+        code = "too_many_entries";
+        break;
+      case vault::VaultError::Budget:
+        status = "409 Conflict";
+        code = "storage_full";
+        break;
+      case vault::VaultError::EntryTooLong:
+        status = "400 Bad Request";
+        code = "entry_too_long";
+        break;
+      case vault::VaultError::BootStrap:
+        status = "409 Conflict";
+        code = "vault_not_open";
+        break;
+      default:
+        log::error("http: vault::add failed %s", vault::toString(rc));
+        break;
+    }
+    out["ok"] = false;
+    out["error"] = code;
+    out["imported"] = added;
+    httpd_resp_set_status(r, status);
+    return sendDoc(r, out, "import_failed");
+  }
+
+  out["ok"] = true;
+  out["imported"] = count;
+  log::info("http: imported %u entries", static_cast<unsigned>(count));
+  return sendDoc(r, out, "import");
 }
 
 esp_err_t healthHandler(httpd_req_t* r) {
@@ -1655,11 +2468,15 @@ bool install() {
       {.uri = "/api/auth/lock", .method = HTTP_POST, .handler = authLockHandler, .user_ctx = nullptr},
       {.uri = "/api/auth/session", .method = HTTP_GET, .handler = authSessionHandler, .user_ctx = nullptr},
       {.uri = "/api/auth/reset", .method = HTTP_POST, .handler = authResetHandler, .user_ctx = nullptr},
+      {.uri = "/api/auth/rekey", .method = HTTP_POST, .handler = authRekeyHandler, .user_ctx = nullptr},
+      {.uri = "/api/auth/password", .method = HTTP_GET, .handler = authPasswordHandler, .user_ctx = nullptr},
       {.uri = "/api/entries", .method = HTTP_GET, .handler = entriesListHandler, .user_ctx = nullptr},
       {.uri = "/api/entries", .method = HTTP_POST, .handler = entriesWriteHandler, .user_ctx = nullptr},
       {.uri = "/api/entries/*", .method = HTTP_GET, .handler = entriesGetHandler, .user_ctx = nullptr},
       {.uri = "/api/entries/*", .method = HTTP_POST, .handler = entriesWriteHandler, .user_ctx = nullptr},
       {.uri = "/api/entries/*", .method = HTTP_DELETE, .handler = entriesDeleteHandler, .user_ctx = nullptr},
+      {.uri = "/api/export", .method = HTTP_GET, .handler = exportHandler, .user_ctx = nullptr},
+      {.uri = "/api/import", .method = HTTP_POST, .handler = importHandler, .user_ctx = nullptr},
       {.uri = "/", .method = HTTP_GET, .handler = staticHandler, .user_ctx = nullptr},
       {.uri = "/*", .method = HTTP_GET, .handler = staticHandler, .user_ctx = nullptr},
   };
@@ -1668,11 +2485,11 @@ bool install() {
   cfg.server_port = config::kHttpPort;
   cfg.ctrl_port = 32768;  // дефолт IDF, но задаём явно: иначе порт выбирается случайно
   cfg.stack_size = kHttpdStackBytes;
-  // Маршрутов 15: 3 прежних (health, /, /*) + 7 auth + 5 entries. Лимит в 16 из
-  // старой версии был впритык: добавление любого маршрута отказало бы в
-  // httpd_register_uri_handler(), и это выглядело бы как «сломался сервер», а не
-  // как «не хватило места». Запас 9 оставлен на будущие маршруты (экспорт,
-  // импорт, смена пароля) без ещё одной правки конфигурации.
+  // Маршрутов 19: 3 прежних (health, /, /*) + 9 auth + 5 entries + экспорт и
+  // импорт. Лимит в 16 из старой версии был впритык: добавление любого
+  // маршрута отказало бы в httpd_register_uri_handler(), и это выглядело бы
+  // как «сломался сервер», а не как «не хватило места». Запас 5 оставлен на
+  // будущие маршруты.
   cfg.max_uri_handlers = 24;
   static_assert(sizeof(routes) / sizeof(routes[0]) <= 24,
                 "маршрутов больше, чем max_uri_handlers");

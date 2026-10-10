@@ -38,6 +38,9 @@ struct Diag {
   uint32_t descString;  // tud_descriptor_string_cb
   uint32_t suspends;
   uint32_t resumes;
+  uint32_t strLangidReqs;  // GET_DESCRIPTOR string 0 (usb_get_langid)
+  uint32_t strMacReqs;     // GET_DESCRIPTOR string 5 (iMACAddress)
+  uint32_t strMacLen;      // сколько символов MAC-строки отдали при последнем запросе
 };
 
 Diag& diag();

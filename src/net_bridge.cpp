@@ -184,11 +184,16 @@ const char* lastStep() { return g_step; }
 int lastError() { return g_err; }
 
 bool ip(uint8_t out[4]) {
-  esp_netif_ip_info_t now = {};
   if (g_dev.base.netif == nullptr) return false;
+  esp_netif_ip_info_t now = {};
   if (esp_netif_get_ip_info(g_dev.base.netif, &now) != ESP_OK) return false;
   ip4Octets(now.ip.addr, out);
   return true;
+}
+
+uint32_t txQueueWaiting() {
+  if (g_dev.txQueue == nullptr) return 0xFFFFFFFFul;
+  return static_cast<uint32_t>(uxQueueMessagesWaiting(g_dev.txQueue));
 }
 
 bool install() {

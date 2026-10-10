@@ -42,6 +42,16 @@ int pbkdf2HmacSha256(const void* password, size_t passwordLen, const void* salt,
 int hmacSha256(const void* key, size_t keyLen, const void* data, size_t dataLen,
                void* macOut, size_t macOutLen);
 
+// SHA-256 одной порции. Нужен для KDF с ключевым файлом: вход PBKDF2 — это
+// пароль, склеенный с SHA-256 файла. Вызывает mbedtls_sha256 (включен в сборку
+// ESP-IDF, см. MBEDTLS_SHA1_C/SHA256_C в конфиге фреймворка).
+int sha256(const void* data, size_t len, uint8_t out[32]);
+
+// HMAC-SHA1. Только для TOTP (RFC 6238 требует SHA-1 по умолчанию); в
+// остальном проекте не используется. mbedtls_sha1 тоже есть в этой сборке.
+int hmacSha1(const void* key, size_t keyLen, const void* data, size_t dataLen,
+             uint8_t macOut[20]);
+
 // AES-256-GCM: шифрование (aad может быть пустым).
 // output = ciphertext || tag (tag фиксированной длины kGcmTagLen).
 int aesGcmEncrypt(const void* key, const void* iv, const void* aad, size_t aadLen,

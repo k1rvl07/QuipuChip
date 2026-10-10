@@ -7,6 +7,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "crypto.h"
@@ -52,7 +53,24 @@ volatile uint32_t g_unlockedAtMs = 0;
 struct Request {
   Job kind;
   JobId id;  // job сюда кладёт единственный писатель — submit()
+  // Новый мастер-пароль. Для Rekey пуст, если пароль остаётся прежним
+  // (тогда rekey возьмёт oldPassword); для остальных job'ов — единственный.
   char password[config::kMaxPassChars];
+  // Текущий мастер-пароль, только для Rekey: обязателен и проверяется в
+  // runRekey боевым KDF (vault::begin) до самой смены ключа.
+  char oldPassword[config::kMaxPassChars];
+  // Сырой ключевой файл целиком (не base64), для KDF в vault::begin/rekey.
+  // Живёт здесь, а не в слоте результата: файл — вход job'а, а не его
+  // результат, и после вызова vault его копия в g_password уже не нужна.
+  // Копируется в submit(), стирается воркером сразу после run*().
+  uint8_t keyFile[config::kKeyFileMaxBytes];
+  size_t keyFileLen;
+  // Новый ключевой файл, только для Rekey при action=Set. Нужен отдельный
+  // буфер: текущий файл (keyFile) живёт до конца проверки старого пароля.
+  uint8_t keyFileNew[config::kKeyFileMaxBytes];
+  size_t keyFileNewLen;
+  KeyfileAction keyfileAction;
+  bool hasNewPassword;
 };
 
 // Слот результата. Один, а не очередь результатов: HTTP-слой опрашивает по id и
@@ -260,7 +278,8 @@ void runUnlock(Request& req) {
     return;
   }
 
-  const vault::VaultError rc = vault::begin(req.password);
+  const vault::VaultError rc =
+      vault::begin(req.password, req.keyFile, req.keyFileLen);
   if (rc == vault::VaultError::Ok) {
     portENTER_CRITICAL(&g_muxSpin);
     g_failCount = 0;
@@ -311,7 +330,6 @@ void runUnlock(Request& req) {
 }
 
 void runProvision(Request& req) {
-  (void)req;
   // Повторная проверка, а не только проверка в submitProvision(): между теми
   // моментами мог появиться результат чужого job'а. Стирание раздела на
   // provisioned-хранилище — необратимая потеря данных.
@@ -332,7 +350,8 @@ void runProvision(Request& req) {
     return;
   }
 
-  const vault::VaultError rc = vault::begin(pw);
+  const vault::VaultError rc =
+      vault::begin(pw, req.keyFile, req.keyFileLen);
   if (rc != vault::VaultError::Ok) {
     crypto::wipe(pw, sizeof(pw));
     log::error("auth: provisioning failed %s", vault::toString(rc));
@@ -416,9 +435,84 @@ void runReset(Request& req) {
   publishResult(req.id, Job::Reset, Result::Ok);
 }
 
+// Смена мастер-пароля и/или ключевого файла. Выполняется только при открытом
+// хранилище: без расшифрованных записей смена ключа невозможна (rekey обязан
+// перезаписать каждую живую запись под новым ключом). Проверка открытости здесь,
+// а не только в submitRekey(): сессия могла закрыться по простою между заказом
+// и исполнением.
+//
+// Перед самой сменой текущая пара «старый пароль (+ текущий ключевой файл)»
+// проверяется боевым KDF через vault::begin() — именно begin() строит материал
+// из req.oldPassword и сверит его с зашифрованным заголовком. Дешевле нельзя:
+// нигде, кроме begin(), верный пароль проверить не с чем (после открытия он
+// стёрт из RAM).
+//
+// Lockout не проверяется и не накручивается: блокировка защищает от перебора
+// неизвестного пароля, а здесь она ничего не добавила бы — попытку смены ключа
+// уже допустил живой сессии, а владелец сессии и так читает всё хранилище.
+void runRekey(Request& req) {
+  if (!vault::initialized()) {
+    log::warn("auth: rekey refused, vault not open");
+    publishResult(req.id, Job::Rekey, Result::Refused);
+    return;
+  }
+
+  // begin() на неверной паре закрывает хранилище (g_ready = false на входе и не
+  // восстанавливается на ранних выходах). Следом закрываем и сессию: иначе auth
+  // остался бы «разблокированным» на закрытом vault — UI после неудачного rekey
+  // и перезагрузки попал бы в приложение с пустым списком записей.
+  const vault::VaultError vb =
+      vault::begin(req.oldPassword, req.keyFile, req.keyFileLen);
+  if (vb != vault::VaultError::Ok) {
+    if (vb == vault::VaultError::WrongPassword) {
+      log::warn("auth: rekey rejected, old password or keyfile mismatch");
+      publishResult(req.id, Job::Rekey, Result::WrongPassword);
+    } else {
+      log::error("auth: rekey verification failed %s", vault::toString(vb));
+      publishResult(req.id, Job::Rekey, Result::Error);
+    }
+    closeSession();
+    return;
+  }
+
+  const char* newPassword =
+      req.hasNewPassword ? req.password : req.oldPassword;
+  const uint8_t* targetKeyFile = nullptr;
+  size_t targetKeyFileLen = 0;
+  if (req.keyfileAction == KeyfileAction::Set) {
+    targetKeyFile = req.keyFileNew;
+    targetKeyFileLen = req.keyFileNewLen;
+  } else if (req.keyfileAction == KeyfileAction::Keep) {
+    // «Оставить» при отключённом ключевом файле — отдельная строка кода, а не
+    // nullptr снизу: тут решение принимается явно, а не по умолчанию.
+    targetKeyFile = req.keyFile;
+    targetKeyFileLen = req.keyFileLen;
+  }
+  const vault::VaultError rc =
+      vault::rekey(newPassword, targetKeyFile, targetKeyFileLen);
+  if (rc == vault::VaultError::Ok) {
+    // Токен сессии переживает смену пароля: сессия не прерывается, и клиент
+    // продолжает работать с тем же X-PM-Session.
+    log::info("auth: master password and/or keyfile changed");
+    publishResult(req.id, Job::Rekey, Result::Ok);
+    return;
+  }
+  if (rc == vault::VaultError::BootStrap) {
+    // Между проверкой begin() и сменой ключа хранилище успели закрыть.
+    publishResult(req.id, Job::Rekey, Result::Refused);
+    return;
+  }
+  log::error("auth: rekey failed %s", vault::toString(rc));
+  publishResult(req.id, Job::Rekey, Result::Error);
+}
+
 void workerTask(void* arg) {
   (void)arg;
-  Request req;
+  // Один воркер — один потребитель очереди. Request вырос (два буфера ключевых
+  // файлов по 4 КБ и два пароля), и на стеке в 12 КБ он уже тесен: вместе с
+  // кадрами begin()/deriveKey() не осталось бы места. Статическая область
+  // влезает гарантированно.
+  static Request req;
   for (;;) {
     // Сессия закрывается по простою здесь, а не в HTTP-обработчике: иначе
     // устройство останется открытым, пока по нему никто не ходит, а простой —
@@ -436,16 +530,34 @@ void workerTask(void* arg) {
       runUnlock(req);
     } else if (req.kind == Job::Reset) {
       runReset(req);
+    } else if (req.kind == Job::Rekey) {
+      runRekey(req);
     } else {
       runProvision(req);
     }
     crypto::wipe(req.password, sizeof(req.password));
+    crypto::wipe(req.oldPassword, sizeof(req.oldPassword));
+    crypto::wipe(req.keyFile, sizeof(req.keyFile));
+    crypto::wipe(req.keyFileNew, sizeof(req.keyFileNew));
   }
+}
+
+// Одноразовый буфер для Request: воркер берёт из очереди копию (по значению), а
+// submit'ы заполняют его через malloc-обёртку, потому что размер Request вырос
+// и не помещается безопасно на больших ветвях стека в FreeRTOS.
+Request* allocRequest() {
+  Request* p = static_cast<Request*>(malloc(sizeof(Request)));
+  if (p == nullptr) {
+    p = static_cast<Request*>(pvPortMalloc(sizeof(Request)));
+  }
+  return p;
 }
 
 // Общий вход для всех submit(). Проверки дешёвые — до входа в критическую
 // секцию; внутри только запись слота, чтобы не держать её на проверках.
-JobId submit(Job kind, const char* password) {
+JobId enqueue(Request& req);
+JobId submit(Job kind, const char* password, const uint8_t* keyFile,
+             size_t keyFileLen) {
   if (g_queue == nullptr) {
     return 0;
   }
@@ -455,23 +567,54 @@ JobId submit(Job kind, const char* password) {
   if (kind == Job::Unlock && lockoutLeftMs() > 0) {
     return 0;
   }
-
-  Request req = {};
-  req.kind = kind;
-  if (password != nullptr) {
-    const size_t n = strlen(password);
-    if (n == 0 || n >= sizeof(req.password)) {
-      return 0;
-    }
-    memcpy(req.password, password, n + 1);
+  // Файл больше предела — ошибка вызывающего, а не «занято»: HTTP-слой
+  // валидирует до отправки, но и здесь проверка обязана быть — молчаливое
+  // усечение сломало бы ключ, и пользователь получил бы WrongPassword на
+  // верный файл.
+  if (keyFileLen > config::kKeyFileMaxBytes || (keyFileLen > 0 && keyFile == nullptr)) {
+    return 0;
   }
 
+  Request* req = allocRequest();
+  if (req == nullptr) {
+    return 0;
+  }
+  *req = {};
+  req->kind = kind;
+  if (password != nullptr) {
+    const size_t n = strlen(password);
+    if (n == 0 || n >= sizeof(req->password)) {
+      free(req);
+      return 0;
+    }
+    memcpy(req->password, password, n + 1);
+  }
+  if (keyFileLen > 0) {
+    memcpy(req->keyFile, keyFile, keyFileLen);
+    req->keyFileLen = keyFileLen;
+  }
+  const JobId id = enqueue(*req);
+  free(req);
+  return id;
+}
+
+// Общая часть всех submit*(): слот результата, id, busy и постановка в очередь.
+// Сюда приходит ALREADY-заполненный Request; слот и гонки защищаются только
+// здесь, а не в вызывающем коде.
+//
+// В очередь уходит копия; локальный req после этого — секрет (два ключевых
+// файла), поэтому стирается по всем путям возврата.
+JobId enqueue(Request& req) {
   JobId id = kNoJob;
   if (xSemaphoreTake(g_mux, portMAX_DELAY) != pdTRUE) {
+    crypto::wipe(req.keyFile, sizeof(req.keyFile));
+    crypto::wipe(req.keyFileNew, sizeof(req.keyFileNew));
     return kNoJob;
   }
   if (g_busy) {
     xSemaphoreGive(g_mux);
+    crypto::wipe(req.keyFile, sizeof(req.keyFile));
+    crypto::wipe(req.keyFileNew, sizeof(req.keyFileNew));
     return kNoJob;
   }
   // Секреты прошлого job'а стираются ДО перезаписи слота: они могли остаться там
@@ -485,7 +628,7 @@ JobId submit(Job kind, const char* password) {
     id = 1;
   }
   g_slot.id = id;
-  g_slot.kind = kind;
+  g_slot.kind = req.kind;
   g_slot.result = Result::Pending;
   g_slot.inFlight = true;
   g_busy = true;
@@ -505,8 +648,13 @@ JobId submit(Job kind, const char* password) {
       g_slot.result = Result::Busy;
       xSemaphoreGive(g_mux);
     }
+    crypto::wipe(req.keyFile, sizeof(req.keyFile));
+    crypto::wipe(req.keyFileNew, sizeof(req.keyFileNew));
     return 0;
   }
+  // Ушла в очередь копия; локальная на стеке больше не нужна, а файлы — секреты.
+  crypto::wipe(req.keyFile, sizeof(req.keyFile));
+  crypto::wipe(req.keyFileNew, sizeof(req.keyFileNew));
   return id;
 }
 
@@ -589,12 +737,13 @@ void setRandomSourceForTest(const uint8_t* bytes, size_t len) {
   g_randPos = 0;
 }
 
-JobId submitProvision() {
-  return submit(Job::Provision, nullptr);
+JobId submitProvision(const uint8_t* keyFile, size_t keyFileLen) {
+  return submit(Job::Provision, nullptr, keyFile, keyFileLen);
 }
 
-JobId submitUnlock(const char* password) {
-  return submit(Job::Unlock, password);
+JobId submitUnlock(const char* password, const uint8_t* keyFile,
+                   size_t keyFileLen) {
+  return submit(Job::Unlock, password, keyFile, keyFileLen);
 }
 
 // Проверки состояния здесь НЕТ намеренно: submit() вернул бы 0 и на занятом
@@ -603,7 +752,73 @@ JobId submitUnlock(const char* password) {
 // воркер (runReset), то есть решение принимается в одном месте и не может
 // разойтись с тем, что потом реально сделает стирание.
 JobId submitReset() {
-  return submit(Job::Reset, nullptr);
+  return submit(Job::Reset, nullptr, nullptr, 0);
+}
+
+// Старый пароль и текущий ключевой файл обязаны прийти уже сюда: они — предмет
+// проверки в runRekey, и пустого oldPassword слот не примет (это была бы смена
+// ключа одним лишь фактом живой сессии).
+//
+// Как и с reset: занятость отличает enqueue(), а «хранилище не открыто» —
+// воркер (runRekey вернёт Refused). HTTP видит разницу между 503 и 409.
+JobId submitRekey(const char* oldPassword, const char* newPassword,
+                  const uint8_t* curKeyFile, size_t curKeyFileLen,
+                  const uint8_t* newKeyFile, size_t newKeyFileLen,
+                  KeyfileAction action) {
+  if (g_queue == nullptr) {
+    return 0;
+  }
+  if (oldPassword == nullptr || oldPassword[0] == '\0') {
+    return 0;
+  }
+  if (curKeyFileLen > config::kKeyFileMaxBytes ||
+      (curKeyFileLen > 0 && curKeyFile == nullptr) ||
+      newKeyFileLen > config::kKeyFileMaxBytes ||
+      (newKeyFileLen > 0 && newKeyFile == nullptr)) {
+    return 0;
+  }
+  if (action == KeyfileAction::Set && (newKeyFileLen == 0 || newKeyFile == nullptr)) {
+    return 0;
+  }
+if (action == KeyfileAction::Clear && curKeyFileLen != 0) {
+    return 0;
+  }
+
+  Request* req = allocRequest();
+  if (req == nullptr) {
+    return 0;
+  }
+  *req = {};
+  req->kind = Job::Rekey;
+  req->keyfileAction = action;
+  {
+    const size_t n = strlen(oldPassword);
+    if (n == 0 || n >= sizeof(req->oldPassword)) {
+      free(req);
+      return 0;
+    }
+    memcpy(req->oldPassword, oldPassword, n + 1);
+  }
+  if (newPassword != nullptr && newPassword[0] != '\0') {
+    const size_t n = strlen(newPassword);
+    if (n >= sizeof(req->password)) {
+      free(req);
+      return 0;
+    }
+    memcpy(req->password, newPassword, n + 1);
+    req->hasNewPassword = true;
+  }
+  if (curKeyFileLen > 0) {
+    memcpy(req->keyFile, curKeyFile, curKeyFileLen);
+    req->keyFileLen = curKeyFileLen;
+  }
+  if (newKeyFileLen > 0) {
+    memcpy(req->keyFileNew, newKeyFile, newKeyFileLen);
+    req->keyFileNewLen = newKeyFileLen;
+  }
+  const JobId id = enqueue(*req);
+  free(req);
+  return id;
 }
 
 bool poll(JobId jobId, JobView* out) {

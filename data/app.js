@@ -1,10 +1,11 @@
 (() => {
-  const $ = (id) => document.getElementById(id);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  'use strict';
 
-  const LS_KEYS = {
-    session: 'pm_session',
-  };
+  const SESSION_KEY = 'pm_session';
+  const IMPORT_BATCH = 4;
+  const JOB_TIMEOUT_MS = 180000;
+  const POLL_MS = 300;
+  const BASE32_RE = /^[A-Z2-7]+=*$/;
 
   const state = {
     provisioned: false,
@@ -12,602 +13,1485 @@
     busy: false,
     failCount: 0,
     lockoutMsLeft: 0,
+    keyfileRequired: false,
     masterPasswordChars: 38,
-    maxEntryCount: 1000,
-    session: localStorage.getItem(LS_KEYS.session) || '',
+    maxEntryCount: 0,
+    keyFileMaxBytes: 4096,
+    session: localStorage.getItem(SESSION_KEY) || '',
     entries: [],
-    entriesFiltered: [],
-    filter: '',
-    currentJob: null,
-    jobStart: 0,
-    provisionJob: null,
-    masterPasswordOnce: '',
-    editingId: 0,
-    lockoutTimer: 0,
+    editingId: null,
+    viewId: null,
+    masterShown: '',
+    inAuthFlow: 0,
+    lockoutTimer: null,
+    totpTimer: null,
   };
 
-  const screens = {
-    setup: $('screenSetup'),
-    unlock: $('screenUnlock'),
-    app: $('screenApp'),
+  const RU = {
+    wrong_password: 'Неверный мастер-пароль',
+    wrong_keyfile: 'Неверный ключевой файл',
+    lockout: 'Слишком много неудачных попыток — блировка',
+    busy: 'Устройство занято другой операцией',
+    refused: 'Операция отклонена устройством',
+    already_provisioned: 'Хранилище уже настроено',
+    keyfile_invalid_base64: 'Некорректный файл ключа',
+    keyfile_too_large: 'Файл ключа больше 4096 байт',
+    keyfile_not_a_string: 'Ошибка чтения файла ключа',
+    confirmation_required: 'Введите RESET для подтверждения',
+    too_many_entries: 'Хранилище переполнено — удалите запись',
+    storage_full: 'Нет места во флеше хранилища',
+    entry_too_long: 'Одно из полей записи слишком длинное',
+    field_too_long_or_not_a_string: 'Одно из полей записи слишком длинное',
+    totp_secret_invalid: 'TOTP-секрет не проходит проверку base32',
+    totp_not_configured: 'TOTP не настроен для этой записи',
+    time_required: 'Нет метки времени для TOTP',
+    format_required: 'Файл не в формате PMX1',
+    version_unsupported: 'Версия формата файла не поддерживается',
+    entries_required: 'В файле нет записей',
+    nothing_to_import: 'Нечего импортировать',
+    batch_too_large: 'В батче больше 4 записей',
+    entry_not_an_object: 'Повреждённая запись в файле',
+    unknown_job: 'Операция устарела — повторите',
+    entry_not_found: 'Запись не найдена',
+    entries_busy: 'Сервер занят, повторите через секунду',
+    session_required: 'Сессия истекла',
+    vault_not_open: 'Хранилище не открыто',
+    vault_load_failed: 'Ошибка чтения хранилища',
+    network: 'нет связи с устройством',
+    job_timeout: 'Операция выполняется слишком долго',
+    bad_job_accept: 'Устройство ответило неожиданным образом',
+    job_failed: 'Операция завершилась ошибкой',
+    http_0: 'нет связи с устройством',
+    kdbx_load_failed: 'Не удалось загрузить модуль .kdbx',
+    kdbx_open_failed: 'Не удалось открыть базу: неверный пароль/ключевой файл или файл повреждён',
+    kdbx_no_file: 'Выберите файл .kdbx',
+    kdbx_no_password: 'Введите пароль файла',
+    kdbx_make_failed: 'Не удалось сформировать файл .kdbx',
   };
 
-  const ui = {
-    headerControls: $('headerControls'),
-    btnProvision: $('btnProvision'),
-    setupStatus: $('setupStatus'),
-    masterBlock: $('masterBlock'),
-    masterPassword: $('masterPassword'),
-    masterLen: $('masterLen'),
-    btnCopyMaster: $('btnCopyMaster'),
-    btnHideMaster: $('btnHideMaster'),
-    btnDoneMaster: $('btnDoneMaster'),
-    formUnlock: $('formUnlock'),
-    inputUnlock: $('inputUnlock'),
-    btnUnlock: $('btnUnlock'),
-    unlockStatus: $('unlockStatus'),
-    lockoutBlock: $('lockoutBlock'),
-    lockoutLeft: $('lockoutLeft'),
-    btnUnlockRetry: $('btnUnlockRetry'),
-    btnLock: $('btnLock'),
-    btnReset: $('btnReset'),
-    searchInput: $('searchInput'),
-    btnNew: $('btnNew'),
-    btnRefresh: $('btnRefresh'),
-    entriesEmpty: $('entriesEmpty'),
-    entriesList: $('entriesList'),
-    appStatus: $('appStatus'),
-    statusLine: $('statusLine'),
-    modalEntry: $('modalEntry'),
-    formEntry: $('formEntry'),
-    entryModalTitle: $('entryModalTitle'),
-    btnEntryClose: $('btnEntryClose'),
-    entryTitle: $('entryTitle'),
-    entryLogin: $('entryLogin'),
-    entryPassword: $('entryPassword'),
-    btnGenPass: $('btnGenPass'),
-    btnTogglePass: $('btnTogglePass'),
-    btnCopyPass: $('btnCopyPass'),
-    genOpts: $('genOpts'),
-    genLen: $('genLen'),
-    genLenVal: $('genLenVal'),
-    genUpper: $('genUpper'),
-    genLower: $('genLower'),
-    genDigits: $('genDigits'),
-    genSym: $('genSym'),
-    entryUrl: $('entryUrl'),
-    entryNote: $('entryNote'),
-    btnEntryDelete: $('btnEntryDelete'),
-    btnEntryCancel: $('btnEntryCancel'),
-    modalReset: $('modalReset'),
-    formReset: $('formReset'),
-    btnResetClose: $('btnResetClose'),
-    inputResetConfirm: $('inputResetConfirm'),
-    resetStatus: $('resetStatus'),
-    btnResetConfirm: $('btnResetConfirm'),
-  };
-
-  function setStatus(el, type, text) {
-    if (!el) return;
-    el.hidden = !text;
-    el.textContent = text;
-    el.classList.remove('status--ok', 'status--warn', 'status--error');
-    if (type === 'ok') el.classList.add('status--ok');
-    if (type === 'warn') el.classList.add('status--warn');
-    if (type === 'error') el.classList.add('status--error');
-    if (type === 'none' && !text) el.hidden = true;
+  function el(id) {
+    return document.getElementById(id);
   }
 
-  function setStatusLine(text) {
-    if (ui.statusLine) ui.statusLine.textContent = text;
+  function errMsg(code) {
+    return RU[code] || code || 'неизвестная ошибка';
+  }
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  class ApiError extends Error {
+    constructor(status, code) {
+      super(`${status}: ${code}`);
+      this.status = status;
+      this.code = code;
+    }
+  }
+
+  function statusOf(node, kind, msg) {
+    node.hidden = false;
+    node.className = `status status--${kind}`;
+    node.textContent = msg;
+  }
+
+  function hideStatus(node) {
+    node.hidden = true;
+    node.textContent = '';
+  }
+
+  function sessionSensitive(path) {
+    return (
+      path.startsWith('/api/entries') ||
+      path.startsWith('/api/export') ||
+      path.startsWith('/api/import') ||
+      path === '/api/auth/session' ||
+      path === '/api/auth/lock' ||
+      path === '/api/auth/password' ||
+      path === '/api/auth/rekey' ||
+      path === '/api/auth/reset'
+    );
+  }
+
+  function saveSession(tok) {
+    state.session = tok;
+    if (tok) {
+      localStorage.setItem(SESSION_KEY, tok);
+    } else {
+      localStorage.removeItem(SESSION_KEY);
+    }
+  }
+
+  async function api(path, opts = {}) {
+    const headers = { Accept: 'application/json' };
+    if (state.session) {
+      headers['X-PM-Session'] = state.session;
+    }
+    let body;
+    if (opts.body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify(opts.body);
+    }
+    let res;
+    try {
+      res = await fetch(path, {
+        method: opts.method || 'GET',
+        headers,
+        body,
+        cache: 'no-store',
+      });
+    } catch (e) {
+      throw new ApiError(0, 'network');
+    }
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      data = null;
+    }
+    if (!res.ok) {
+      const code = (data && data.error) || `http_${res.status}`;
+      if (res.status === 401 && sessionSensitive(path) &&
+          (code === 'session_required' || state.inAuthFlow === 0)) {
+        // session_required обязан уводить на экран разблокировки ВСЕГДА, в том
+        // числе внутри submitJob(): иначе счётчик inAuthFlow поднят, и операция
+        // показывает молчаливый статус «Сессия истекла» в модалке, которая уже
+        // не может ничего сделать — тупик, из которого пользователь не выходит.
+        handleSessionExpired();
+      }
+      throw new ApiError(res.status, code);
+    }
+    return { status: res.status, data };
+  }
+
+  async function submitJob(path, body) {
+    state.inAuthFlow += 1;
+    try {
+      const acc = await api(path, { method: 'POST', body });
+      if (acc.status !== 202 || !acc.data || !acc.data.job) {
+        throw new ApiError(acc.status, 'bad_job_accept');
+      }
+      const deadline = Date.now() + JOB_TIMEOUT_MS;
+      for (;;) {
+        const r = await api(`/api/auth/job/${acc.data.job}`);
+        if (r.data && r.data.state === 'pending') {
+          if (Date.now() > deadline) {
+            throw new ApiError(0, 'job_timeout');
+          }
+          await sleep(POLL_MS);
+          continue;
+        }
+        if (r.data && r.data.result === 'ok') {
+          if (r.data.session_token) {
+            saveSession(r.data.session_token);
+          }
+          return r.data;
+        }
+        throw new ApiError(r.status, (r.data && r.data.error) || 'job_failed');
+      }
+    } finally {
+      state.inAuthFlow -= 1;
+    }
+  }
+
+  async function fetchState() {
+    const r = await api('/api/auth/state');
+    const d = r.data;
+    state.provisioned = !!d.provisioned;
+    state.unlocked = !!d.unlocked;
+    state.busy = !!d.busy;
+    state.failCount = d.failCount | 0;
+    state.lockoutMsLeft = d.lockoutMsLeft | 0;
+    state.keyfileRequired = !!d.keyfileRequired;
+    state.masterPasswordChars = d.masterPasswordChars || 38;
+    state.maxEntryCount = d.maxEntryCount || 0;
+    state.keyFileMaxBytes = d.keyFileMaxBytes || 4096;
+    return d;
+  }
+
+  async function sessionValid() {
+    if (!state.session) {
+      return false;
+    }
+    try {
+      const r = await api('/api/auth/session');
+      state.entriesCount = r.data.entryCount | 0;
+      return true;
+    } catch (e) {
+      if (e.code === 'session_required' || e.status === 401) {
+        saveSession('');
+        return false;
+      }
+      throw e;
+    }
+  }
+
+  function handleSessionExpired() {
+    saveSession('');
+    // Открытые модалки обязаны закрываться: showScreen('unlock') прячет экран
+    // приложения, но <dialog> лежит вне экранов и остался бы висеть поверх
+    // экрана разблокировки с мёртвым содержимым.
+    document.querySelectorAll('dialog[open]').forEach((d) => d.close());
+    if (el('screenApp') && !el('screenApp').hidden) {
+      showScreen('unlock');
+      const st = el('unlockStatus');
+      statusOf(st, 'warn', 'Сессия истекла — войдите заново');
+      refreshKeyfileBlock();
+    }
   }
 
   function showScreen(name) {
-    Object.entries(screens).forEach(([k, el]) => {
-      if (!el) return;
-      el.hidden = k !== name;
-    });
-    ui.headerControls.hidden = name !== 'app';
+    el('screenSetup').hidden = name !== 'setup';
+    el('screenUnlock').hidden = name !== 'unlock';
+    el('screenApp').hidden = name !== 'app';
+    el('headerControls').hidden = name !== 'app';
+    if (name !== 'unlock') {
+      stopLockoutTimer();
+    }
+    if (name !== 'app') {
+      stopTotpTimer();
+    }
   }
 
-  function saveSession(s) {
-    state.session = s || '';
-    if (s) localStorage.setItem(LS_KEYS.session, s);
-    else localStorage.removeItem(LS_KEYS.session);
+  function updateFooter() {
+    const parts = [];
+    parts.push(state.provisioned ? (state.unlocked ? 'разблокировано' : 'заблокировано') : 'не настроено');
+    if (state.provisioned) {
+      parts.push(`записей: ${state.entries.length}${state.maxEntryCount ? `/${state.maxEntryCount}` : ''}`);
+      parts.push(`ключевой файл: ${state.keyfileRequired ? 'да' : 'нет'}`);
+      parts.push(`неудач: ${state.failCount}`);
+    }
+    parts.push(state.session ? 'сессия активна' : 'без сессии');
+    el('statusLine').textContent = parts.join(' · ');
   }
 
-  function api(path, opts = {}) {
-    const headers = new Headers(opts.headers || {});
-    if (state.session) headers.set('X-PM-Session', state.session);
-    if (opts.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-    return fetch(path, { ...opts, headers }).catch((e) => {
-      return new Response(JSON.stringify({ ok: false, error: 'network_error' }), {
-        status: 0,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    });
-  }
-
-  async function apiJson(path, opts = {}) {
-    const r = await api(path, opts);
-    let data = { ok: false, error: 'unknown' };
+  async function boot() {
     try {
-      data = await r.json();
-    } catch (_) {}
-    return { res: r, data };
-  }
-
-  async function loadState() {
-    const { data } = await apiJson('/api/auth/state', { method: 'GET' });
-    if (data && data.ok) {
-      state.provisioned = !!data.provisioned;
-      state.unlocked = !!data.unlocked;
-      state.busy = !!data.busy;
-      state.failCount = data.failCount || 0;
-      state.lockoutMsLeft = data.lockoutMsLeft || 0;
-      state.masterPasswordChars = data.masterPasswordChars || 38;
-      state.maxEntryCount = data.maxEntryCount || 1000;
-    }
-    if (state.unlocked) showScreen('app');
-    else if (state.provisioned) showScreen('unlock');
-    else showScreen('setup');
-    updateLockoutUI();
-    return data;
-  }
-
-  function updateLockoutUI() {
-    if (state.lockoutMsLeft > 0) {
-      const s = Math.ceil(state.lockoutMsLeft / 1000);
-      ui.lockoutLeft.textContent = String(s);
-      ui.lockoutBlock.hidden = false;
-      ui.inputUnlock.disabled = true;
-      ui.btnUnlock.disabled = true;
-    } else {
-      ui.lockoutBlock.hidden = true;
-      ui.inputUnlock.disabled = false;
-      ui.btnUnlock.disabled = false;
-    }
-  }
-
-  async function pollJob(jobId, timeoutMs = 120000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-      const { data } = await apiJson(`/api/auth/job/${jobId}`, { method: 'GET' });
-      if (!data || !data.ok) return data;
-      if (data.state === 'pending') {
-        await sleep(500);
-        continue;
+      await fetchState();
+      if (!state.provisioned) {
+        showScreen('setup');
+        updateFooter();
+        return;
       }
-      if (data.result === 'ok') return data;
-      return data;
+      if (await sessionValid()) {
+        await enterApp();
+        return;
+      }
+      showScreen('unlock');
+      refreshKeyfileBlock();
+      if (state.lockoutMsLeft > 0) {
+        startLockoutTimer();
+      }
+      updateFooter();
+      statusOf(el('unlockStatus'), 'warn', 'Требуется мастер-пароль');
+    } catch (e) {
+      el('statusLine').textContent = `Нет связи с устройством (${errMsg(e.code)}), повтор через 3 с…`;
+      setTimeout(boot, 3000);
     }
-    return { ok: false, error: 'job_timeout' };
   }
 
-  async function doProvision() {
-    setStatus(ui.setupStatus, 'warn', 'Создание хранилища, подождите ~2–3 секунды...');
-    ui.btnProvision.disabled = true;
-    const { res, data } = await apiJson('/api/auth/provision', { method: 'POST' });
-    if (res.status !== 202 || !data || !data.ok || !data.job) {
-      const err = (data && data.error) || 'provision_failed';
-      ui.btnProvision.disabled = false;
-      setStatus(ui.setupStatus, 'error', `Ошибка: ${err}`);
-      return;
-    }
-    const job = data.job;
-    const resJob = await pollJob(job, 150000);
-    if (!resJob || !resJob.ok) {
-      ui.btnProvision.disabled = false;
-      const err = resJob && resJob.error ? resJob.error : 'job_failed';
-      setStatus(ui.setupStatus, 'error', `Ошибка: ${err}`);
-      return;
-    }
-    if (resJob.password) {
-      state.masterPasswordOnce = resJob.password;
-      ui.masterPassword.value = resJob.password;
-      ui.masterLen.textContent = String(resJob.password.length);
-      ui.masterBlock.hidden = false;
-      ui.masterPassword.type = 'text';
-      setStatus(ui.setupStatus, 'ok', 'Хранилище создано. Сохраните мастер-пароль.');
-    }
-    if (resJob.session_token) saveSession(resJob.session_token);
-    await loadState();
-    if (!state.unlocked && resJob.session_token) {
-      await loadEntries();
-    }
-    ui.btnProvision.disabled = false;
-  }
-
-  async function doUnlock(pw) {
-    setStatus(ui.unlockStatus, 'warn', 'Разблокировка, подождите ~5–6 секунд...');
-    ui.btnUnlock.disabled = true;
-    const { res, data } = await apiJson('/api/auth/unlock', {
-      method: 'POST',
-      body: JSON.stringify({ password: pw }),
-    });
-    if (res.status !== 202 || !data || !data.ok || !data.job) {
-      const err = (data && data.error) || 'unlock_failed';
-      ui.btnUnlock.disabled = false;
-      setStatus(ui.unlockStatus, 'error', `Ошибка: ${err}`);
-      if (err === 'lockout') await loadState();
-      if (err === 'busy') await sleep(1000);
-      updateLockoutUI();
-      return;
-    }
-    const job = data.job;
-    const resJob = await pollJob(job, 200000);
-    if (!resJob || !resJob.ok) {
-      ui.btnUnlock.disabled = false;
-      const err = resJob && resJob.error ? resJob.error : 'job_failed';
-      setStatus(ui.unlockStatus, 'error', `Ошибка: ${err}`);
-      await loadState();
-      updateLockoutUI();
-      return;
-    }
-    if (resJob.session_token) saveSession(resJob.session_token);
-    setStatus(ui.unlockStatus, 'ok', 'Разблокировано');
-    await loadState();
+  async function enterApp() {
+    showScreen('app');
+    hideStatus(el('unlockStatus'));
     await loadEntries();
-    ui.btnUnlock.disabled = false;
-    ui.inputUnlock.value = '';
-  }
-
-  async function doLock() {
-    const { data } = await apiJson('/api/auth/lock', { method: 'POST' });
-    if (data && data.ok) {
-      saveSession('');
-      await loadState();
-    } else {
-      setStatusLine('Не удалось заблокировать');
-    }
+    updateFooter();
   }
 
   async function loadEntries() {
-    setStatus(ui.appStatus, 'none', '');
-    const { data } = await apiJson('/api/entries', { method: 'GET' });
-    if (!data || !data.ok) {
-      setStatus(ui.appStatus, 'error', `Ошибка загрузки: ${data && data.error ? data.error : 'unknown'}`);
-      return;
-    }
-    state.entries = Array.isArray(data.entries) ? data.entries : [];
-    applyFilter();
-  }
-
-  function applyFilter() {
-    const f = (state.filter || '').toLowerCase();
-    if (!f) {
-      state.entriesFiltered = state.entries.slice();
-    } else {
-      state.entriesFiltered = state.entries.filter((e) => {
-        const t = [e.title || '', e.login || '', e.url || ''].join(' ').toLowerCase();
-        return t.includes(f);
-      });
-    }
-    renderEntries();
-  }
-
-  function renderEntries() {
-    ui.entriesList.innerHTML = '';
-    if (state.entriesFiltered.length === 0) {
-      ui.entriesEmpty.hidden = false;
-      return;
-    }
-    ui.entriesEmpty.hidden = true;
-    for (const e of state.entriesFiltered) {
-      const card = document.createElement('div');
-      card.className = 'entry-card';
-      const header = document.createElement('div');
-      header.className = 'entry-card__header';
-      const titleEl = document.createElement('h3');
-      titleEl.className = 'entry-card__title';
-      titleEl.textContent = e.title || '(без названия)';
-      header.appendChild(titleEl);
-      card.appendChild(header);
-      const meta = document.createElement('div');
-      meta.className = 'entry-card__meta';
-      if (e.login) {
-        const r = row('Логин', e.login, true);
-        meta.appendChild(r);
-      }
-      if (e.url) {
-        const r = row('URL', e.url);
-        const a = document.createElement('a');
-        a.href = e.url;
-        a.target = '_blank';
-        a.rel = 'noreferrer';
-        a.textContent = e.url;
-        r.querySelector('.entry-card__value').innerHTML = '';
-        r.querySelector('.entry-card__value').appendChild(a);
-        meta.appendChild(r);
-      }
-      card.appendChild(meta);
-      const acts = document.createElement('div');
-      acts.className = 'entry-card__actions';
-      const btnView = mkBtn('Посмотреть', () => viewEntry(e.id));
-      const btnEdit = mkBtn('Редактировать', () => editEntry(e.id));
-      const btnCopyLogin = mkBtn('Копировать логин', () => copyText(e.login || ''));
-      const btnCopyPass = mkBtn('Показать/скопировать пароль', () => viewSecret(e.id));
-      acts.append(btnView, btnEdit, btnCopyLogin, btnCopyPass);
-      card.appendChild(acts);
-      ui.entriesList.appendChild(card);
-    }
-    function row(label, val, mono = false) {
-      const d = document.createElement('div');
-      d.className = 'entry-card__meta-row';
-      const l = document.createElement('span');
-      l.className = 'entry-card__label';
-      l.textContent = label;
-      const v = document.createElement('span');
-      v.className = 'entry-card__value' + (mono ? ' entry-card__value--mono' : '');
-      v.textContent = val;
-      d.append(l, v);
-      return d;
-    }
-    function mkBtn(txt, fn) {
-      const b = document.createElement('button');
-      b.className = 'btn btn--ghost btn--sm';
-      b.type = 'button';
-      b.textContent = txt;
-      b.onclick = (e) => {
-        e.stopPropagation();
-        fn();
-      };
-      return b;
-    }
-  }
-
-  async function viewEntry(id) {
-    const { data } = await apiJson(`/api/entries/${id}`, { method: 'GET' });
-    if (!data || !data.ok) return alert(`Ошибка: ${data && data.error ? data.error : 'unknown'}`);
-    const lines = [];
-    if (data.title) lines.push(`Название: ${data.title}`);
-    if (data.login) lines.push(`Логин: ${data.login}`);
-    if (data.url) lines.push(`URL: ${data.url}`);
-    if (data.note) lines.push(`Заметки:\n${data.note}`);
-    lines.push(`Есть пароль: ${data.hasPassword ? 'Да' : 'Нет'}`);
-    alert(lines.join('\n\n'));
-  }
-
-  async function viewSecret(id) {
-    const { data } = await apiJson(`/api/entries/${id}/secret`, { method: 'GET' });
-    if (!data || !data.ok) return alert(`Ошибка: ${data && data.error ? data.error : 'unknown'}`);
-    const pw = data.password || '';
-    if (!pw) return alert('Пароль пуст');
     try {
-      await navigator.clipboard.writeText(pw);
-      setStatusLine('Пароль скопирован в буфер обмена');
-    } catch (_) {
-      prompt('Пароль (не удалось скопировать):', pw);
-    }
-    setTimeout(() => setStatusLine(''), 1500);
-  }
-
-  function openEntryModal(editing = 0) {
-    state.editingId = editing;
-    ui.entryModalTitle.textContent = editing ? 'Редактировать запись' : 'Новая запись';
-    ui.btnEntryDelete.hidden = !editing;
-    ui.genOpts.hidden = true;
-    ui.entryPassword.type = 'password';
-    if (!editing) {
-      ui.entryTitle.value = '';
-      ui.entryLogin.value = '';
-      ui.entryPassword.value = '';
-      ui.entryUrl.value = '';
-      ui.entryNote.value = '';
-    }
-    if (ui.modalEntry.showModal) ui.modalEntry.showModal();
-    else {
-      ui.modalEntry.setAttribute('open', '');
+      const r = await api('/api/entries');
+      state.entries = r.data.entries || [];
+      render();
+      updateFooter();
+    } catch (e) {
+      statusOf(el('appStatus'), 'error', `Не удалось загрузить записи: ${errMsg(e.code)}`);
     }
   }
 
-  async function editEntry(id) {
-    const { data } = await apiJson(`/api/entries/${id}`, { method: 'GET' });
-    if (!data || !data.ok) return alert(`Ошибка: ${data && data.error ? data.error : 'unknown'}`);
-    ui.entryTitle.value = data.title || '';
-    ui.entryLogin.value = data.login || '';
-    ui.entryPassword.value = '';
-    ui.entryUrl.value = data.url || '';
-    ui.entryNote.value = data.note || '';
-    openEntryModal(id);
+  function h(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) {
+      node.className = className;
+    }
+    if (text !== undefined && text !== null) {
+      node.textContent = text;
+    }
+    return node;
   }
 
-  function randChar(set) {
-    return set[Math.floor(Math.random() * set.length)];
+  function render() {
+    const q = el('searchInput').value.trim().toLowerCase();
+    const list = el('entriesList');
+    list.textContent = '';
+    const rows = state.entries.filter((e) => {
+      if (!q) {
+        return true;
+      }
+      const hay = `${e.title || ''}\n${e.login || ''}\n${e.url || ''}\n${e.tags || ''}`.toLowerCase();
+      return hay.includes(q);
+    });
+    el('entriesEmpty').hidden = state.entries.length !== 0;
+    for (const e of rows) {
+      list.appendChild(card(e));
+    }
   }
+
+  function card(e) {
+    const box = h('div', 'entry-card');
+    const head = h('div', 'entry-card__header');
+    head.appendChild(h('h3', 'entry-card__title', e.title || '(без названия)'));
+    box.appendChild(head);
+
+    const meta = h('div', 'entry-card__meta');
+    if (e.login) {
+      const row = h('div', 'entry-card__meta-row');
+      row.appendChild(h('span', 'entry-card__label', 'Логин'));
+      row.appendChild(h('span', 'entry-card__value entry-card__value--mono', e.login));
+      meta.appendChild(row);
+    }
+    if (e.url) {
+      const row = h('div', 'entry-card__meta-row');
+      row.appendChild(h('span', 'entry-card__label', 'URL'));
+      row.appendChild(h('span', 'entry-card__value', e.url));
+      meta.appendChild(row);
+    }
+    box.appendChild(meta);
+
+    const tagList = (e.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
+    if (tagList.length || e.hasTotp) {
+      const badges = h('div', 'entry-card__badges');
+      for (const t of tagList.slice(0, 8)) {
+        badges.appendChild(h('span', 'badge', t));
+      }
+      if (e.hasTotp) {
+        badges.appendChild(h('span', 'badge badge--totp', 'TOTP'));
+      }
+      box.appendChild(badges);
+    }
+
+    const actions = h('div', 'entry-card__actions');
+    const bView = h('button', 'btn btn--ghost btn--sm', 'Просмотр');
+    bView.type = 'button';
+    bView.addEventListener('click', () => openView(e.id));
+    const bEdit = h('button', 'btn btn--ghost btn--sm', 'Редактировать');
+    bEdit.type = 'button';
+    bEdit.addEventListener('click', () => openEdit(e.id));
+    actions.appendChild(bView);
+    actions.appendChild(bEdit);
+    if (e.login) {
+      const bCopy = h('button', 'btn btn--ghost btn--sm', 'Копировать логин');
+      bCopy.type = 'button';
+      bCopy.addEventListener('click', () => copyText(e.login, bCopy));
+      actions.appendChild(bCopy);
+    }
+    box.appendChild(actions);
+    return box;
+  }
+
+  async function copyText(text, btn) {
+    try {
+      await navigator.clipboard.writeText(text);
+      if (btn) {
+        const old = btn.textContent;
+        btn.textContent = 'Скопировано';
+        setTimeout(() => {
+          btn.textContent = old;
+        }, 1200);
+      }
+    } catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+  }
+
+  async function fileToB64(file) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    let s = '';
+    for (let i = 0; i < buf.length; i += 1) {
+      s += String.fromCharCode(buf[i]);
+    }
+    return btoa(s);
+  }
+
+  async function readKeyfile(input, maxBytes) {
+    const file = input.files && input.files[0];
+    if (!file) {
+      return { absent: true };
+    }
+    if (file.size > maxBytes) {
+      throw new ApiError(400, 'keyfile_too_large');
+    }
+    return { absent: false, b64: await fileToB64(file) };
+  }
+
+  function randInt(max) {
+    const zone = Math.floor(0x10000 / max) * max;
+    const a = new Uint16Array(1);
+    for (;;) {
+      crypto.getRandomValues(a);
+      if (a[0] < zone) {
+        return a[0] % max;
+      }
+    }
+  }
+
+  const SETS = {
+    upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    lower: 'abcdefghijklmnopqrstuvwxyz',
+    digits: '0123456789',
+    sym: '!@#$%^&*()-_=+[]{};:,.?/',
+  };
 
   function generatePassword() {
-    const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    const lower = 'abcdefghijklmnopqrstuvwxyz';
-    const digits = '0123456789';
-    const sym = '!@#$%^&*()-_=+[]{}';
-    let sets = [];
-    if (ui.genUpper.checked) sets.push(upper);
-    if (ui.genLower.checked) sets.push(lower);
-    if (ui.genDigits.checked) sets.push(digits);
-    if (ui.genSym.checked) sets.push(sym);
-    if (sets.length === 0) sets = [lower, digits];
-    const len = parseInt(ui.genLen.value) || 16;
-    let res = '';
-    for (let i = 0; i < len; i++) {
-      const s = sets[i % sets.length];
-      res += randChar(s);
+    const len = parseInt(el('genLen').value, 10) || 16;
+    const chosen = [];
+    for (const key of ['upper', 'lower', 'digits', 'sym']) {
+      const cb = el(`gen${key.charAt(0).toUpperCase()}${key.slice(1)}`);
+      if (cb.checked) {
+        chosen.push(SETS[key]);
+      }
     }
-    return res;
+    if (chosen.length === 0) {
+      chosen.push(SETS.lower);
+      el('genLower').checked = true;
+    }
+    const union = chosen.join('');
+    const out = [];
+    for (const set of chosen) {
+      out.push(set.charAt(randInt(set.length)));
+    }
+    while (out.length < len) {
+      out.push(union.charAt(randInt(union.length)));
+    }
+    out.length = len;
+    for (let i = out.length - 1; i > 0; i -= 1) {
+      const j = randInt(i + 1);
+      const t = out[i];
+      out[i] = out[j];
+      out[j] = t;
+    }
+    return out.join('');
   }
 
-  async function saveEntry() {
-    const title = ui.entryTitle.value.trim();
-    const login = ui.entryLogin.value.trim();
-    const password = ui.entryPassword.value;
-    const url = ui.entryUrl.value.trim();
-    const note = ui.entryNote.value;
-    if (!title && !login) {
-      alert('Нужно указать название или логин');
+  async function doProvision() {
+    const btn = el('btnProvision');
+    const st = el('setupStatus');
+    hideStatus(st);
+    btn.disabled = true;
+    try {
+      const kf = await readKeyfile(el('inputSetupKeyfile'), state.keyFileMaxBytes);
+      const body = {};
+      if (!kf.absent) {
+        body.keyfile = kf.b64;
+      }
+      const res = await submitJob('/api/auth/provision', body);
+      state.masterShown = res.password || '';
+      state.keyfileRequired = !kf.absent;
+      el('masterPassword').value = state.masterShown;
+      el('masterLen').textContent = String(state.masterShown.length);
+      el('masterBlock').hidden = false;
+      statusOf(st, 'ok', 'Хранилище создано. Сохраните мастер-пароль.');
+      updateFooter();
+    } catch (e) {
+      statusOf(st, 'error', errMsg(e.code));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function toggleMaster() {
+    const ta = el('masterPassword');
+    if (ta.value && ta.value !== '•'.repeat(state.masterShown.length)) {
+      ta.value = '•'.repeat(state.masterShown.length);
+    } else {
+      ta.value = state.masterShown;
+    }
+  }
+
+  async function doUnlock(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('unlockStatus');
+    const btn = el('btnUnlock');
+    hideStatus(st);
+    const pw = el('inputUnlock').value;
+    if (!pw) {
+      statusOf(st, 'error', 'Введите мастер-пароль');
       return;
     }
-    const body = {};
-    body.title = title;
-    body.login = login;
-    if (password.length > 0) body.password = password;
-    body.url = url;
-    body.note = note;
-    const id = state.editingId;
-    const path = id ? `/api/entries/${id}` : '/api/entries';
-    const { data } = await apiJson(path, { method: 'POST', body: JSON.stringify(body) });
-    if (!data || !data.ok) {
-      alert(`Ошибка сохранения: ${data && data.error ? data.error : 'unknown'}`);
+    btn.disabled = true;
+    try {
+      const body = { password: pw };
+      if (state.keyfileRequired) {
+        const kf = await readKeyfile(el('inputUnlockKeyfile'), state.keyFileMaxBytes);
+        if (kf.absent) {
+          statusOf(st, 'error', 'Выберите ключевой файл');
+          return;
+        }
+        body.keyfile = kf.b64;
+      }
+      await submitJob('/api/auth/unlock', body);
+      el('inputUnlock').value = '';
+      const file = el('inputUnlockKeyfile');
+      if (file) {
+        file.value = '';
+      }
+      await fetchState();
+      await enterApp();
+    } catch (err) {
+      statusOf(st, 'error', errMsg(err.code));
+      try {
+        await fetchState();
+        updateFooter();
+        if (state.lockoutMsLeft > 0) {
+          startLockoutTimer();
+        }
+      } catch (e2) {
+        /* состояние не обновилось — оставляем как есть */
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function refreshKeyfileBlock() {
+    el('unlockKeyfileBlock').hidden = !state.keyfileRequired;
+  }
+
+  function startLockoutTimer() {
+    stopLockoutTimer();
+    el('lockoutBlock').hidden = false;
+    let left = Math.ceil(state.lockoutMsLeft / 1000);
+    el('lockoutLeft').textContent = String(left);
+    state.lockoutTimer = setInterval(() => {
+      left -= 1;
+      el('lockoutLeft').textContent = String(Math.max(left, 0));
+      if (left <= 0) {
+        stopLockoutTimer();
+        boot();
+      }
+    }, 1000);
+  }
+
+  function stopLockoutTimer() {
+    if (state.lockoutTimer) {
+      clearInterval(state.lockoutTimer);
+      state.lockoutTimer = null;
+    }
+    el('lockoutBlock').hidden = true;
+  }
+
+  async function doLock() {
+    try {
+      await api('/api/auth/lock', { method: 'POST', body: {} });
+    } catch (e) {
+      /* блокировка не прошла — всё равно уходим на экран входа */
+    }
+    saveSession('');
+    state.unlocked = false;
+    showScreen('unlock');
+    refreshKeyfileBlock();
+    statusOf(el('unlockStatus'), 'ok', 'Хранилище заблокировано');
+    updateFooter();
+  }
+
+  async function openEdit(id) {
+    const st = el('appStatus');
+    hideStatus(st);
+    state.editingId = id;
+    el('entryModalTitle').textContent = id ? 'Редактирование записи' : 'Новая запись';
+    el('entryPasswordHint').hidden = !id;
+    el('btnEntryDelete').hidden = !id;
+    el('entryTitle').value = '';
+    el('entryLogin').value = '';
+    el('entryPassword').value = '';
+    el('entryUrl').value = '';
+    el('entryTags').value = '';
+    el('entryTotp').value = '';
+    el('entryNote').value = '';
+    el('genOpts').hidden = true;
+    if (id) {
+      try {
+        const r = await api(`/api/entries/${id}`);
+        const d = r.data;
+        el('entryTitle').value = d.title || '';
+        el('entryLogin').value = d.login || '';
+        el('entryUrl').value = d.url || '';
+        el('entryTags').value = d.tags || '';
+        el('entryTotp').value = d.totp || '';
+        el('entryNote').value = d.note || '';
+      } catch (e) {
+        statusOf(st, 'error', `Не удалось открыть запись: ${errMsg(e.code)}`);
+        return;
+      }
+    }
+    el('modalEntry').showModal();
+  }
+
+  async function saveEntry(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('appStatus');
+    const totp = el('entryTotp').value.trim().toUpperCase();
+    if (totp && !BASE32_RE.test(totp)) {
+      el('entryTotp').value = totp;
+      statusOf(st, 'error', 'TOTP-секрет должен быть base32 (A–Z, 2–7)');
       return;
     }
-    ui.modalEntry.close();
-    await loadEntries();
+    const body = {
+      title: el('entryTitle').value,
+      login: el('entryLogin').value,
+      url: el('entryUrl').value,
+      note: el('entryNote').value,
+      tags: el('entryTags').value,
+      totp: totp,
+    };
+    const pw = el('entryPassword').value;
+    if (pw) {
+      body.password = pw;
+    }
+    const btn = el('btnEntrySave');
+    btn.disabled = true;
+    try {
+      const path = state.editingId ? `/api/entries/${state.editingId}` : '/api/entries';
+      await api(path, { method: 'POST', body });
+      el('modalEntry').close();
+      await loadEntries();
+    } catch (err) {
+      statusOf(st, 'error', `Не удалось сохранить: ${errMsg(err.code)}`);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   async function deleteEntry() {
-    const id = state.editingId;
-    if (!id) return;
-    if (!confirm('Удалить запись?')) return;
-    const { data } = await apiJson('/api/entries', {
-      method: 'DELETE',
-      body: JSON.stringify({ confirm: 'DELETE' }),
-    });
-    const path = `/api/entries/${id}`;
-    const res = await apiJson(path, { method: 'DELETE', body: JSON.stringify({ confirm: 'DELETE' }) });
-    if (!res.data || !res.data.ok) {
-      alert(`Ошибка удаления: ${res.data && res.data.error ? res.data.error : 'unknown'}`);
+    if (!state.editingId) {
       return;
     }
-    ui.modalEntry.close();
-    await loadEntries();
-  }
-
-  async function resetDevice() {
-    const v = ui.inputResetConfirm.value.trim();
-    if (v !== 'RESET') {
-      setStatus(ui.resetStatus, 'warn', 'Нужно ввести RESET');
+    if (!window.confirm('Удалить запись без возможности восстановления?')) {
       return;
     }
-    setStatus(ui.resetStatus, 'warn', 'Сброс хранилища, ждите...');
-    ui.btnResetConfirm.disabled = true;
-    const { res, data } = await apiJson('/api/auth/reset', {
-      method: 'POST',
-      body: JSON.stringify({ confirm: 'RESET' }),
-    });
-    if (res.status !== 202 || !data || !data.ok || !data.job) {
-      const err = (data && data.error) || 'reset_failed';
-      ui.btnResetConfirm.disabled = false;
-      setStatus(ui.resetStatus, 'error', `Ошибка: ${err}`);
-      return;
-    }
-    const job = data.job;
-    const resJob = await pollJob(job, 150000);
-    if (!resJob || !resJob.ok) {
-      ui.btnResetConfirm.disabled = false;
-      const err = resJob && resJob.error ? resJob.error : 'job_failed';
-      setStatus(ui.resetStatus, 'error', `Ошибка: ${err}`);
-      return;
-    }
-    saveSession('');
-    ui.modalReset.close();
-    ui.inputResetConfirm.value = '';
-    ui.btnResetConfirm.disabled = true;
-    setStatus(ui.resetStatus, 'none', '');
-    await loadState();
-    state.entries = [];
-    renderEntries();
-  }
-
-  async function init() {
-    ui.masterPassword.value = '';
-    ui.masterBlock.hidden = true;
-    await loadState();
-    if (state.unlocked) await loadEntries();
-    setStatusLine('Готово');
-  }
-
-  ui.btnProvision.onclick = () => doProvision();
-  ui.btnCopyMaster.onclick = async () => {
+    const st = el('appStatus');
     try {
-      await navigator.clipboard.writeText(ui.masterPassword.value);
-      setStatusLine('Скопировано');
-      setTimeout(() => setStatusLine(''), 1000);
-    } catch (_) {}
-  };
-  ui.btnHideMaster.onclick = () => {
-    ui.masterPassword.type = ui.masterPassword.type === 'password' ? 'text' : 'password';
-  };
-  ui.btnDoneMaster.onclick = () => {
-    ui.masterBlock.hidden = true;
-    state.masterPasswordOnce = '';
-  };
-  ui.formUnlock.onsubmit = (e) => {
-    e.preventDefault();
-    doUnlock(ui.inputUnlock.value);
-  };
-  ui.btnUnlockRetry.onclick = () => loadState();
-  ui.btnLock.onclick = () => doLock();
-  ui.btnReset.onclick = () => {
-    ui.inputResetConfirm.value = '';
-    ui.btnResetConfirm.disabled = true;
-    setStatus(ui.resetStatus, 'none', '');
-    if (ui.modalReset.showModal) ui.modalReset.showModal();
-    else ui.modalReset.setAttribute('open', '');
-  };
-  ui.searchInput.oninput = () => {
-    state.filter = ui.searchInput.value;
-    applyFilter();
-  };
-  ui.btnNew.onclick = () => openEntryModal(0);
-  ui.btnRefresh.onclick = () => loadEntries();
-  ui.btnEntryClose.onclick = () => ui.modalEntry.close();
-  ui.btnEntryCancel.onclick = () => ui.modalEntry.close();
-  ui.formEntry.onsubmit = (e) => {
-    e.preventDefault();
-    saveEntry();
-  };
-  ui.btnEntryDelete.onclick = () => deleteEntry();
-  ui.btnGenPass.onclick = () => {
-    ui.genOpts.hidden = !ui.genOpts.hidden;
-    if (!ui.genOpts.hidden) {
-      ui.entryPassword.value = generatePassword();
-      ui.entryPassword.type = 'text';
+      await api(`/api/entries/${state.editingId}`, {
+        method: 'DELETE',
+        body: { confirm: 'DELETE' },
+      });
+      el('modalEntry').close();
+      await loadEntries();
+    } catch (e) {
+      statusOf(st, 'error', `Не удалось удалить: ${errMsg(e.code)}`);
     }
-  };
-  ui.genLen.oninput = () => {
-    ui.genLenVal.textContent = ui.genLen.value;
-    if (!ui.genOpts.hidden) ui.entryPassword.value = generatePassword();
-  };
-  ui.genUpper.onchange = () => {
-    if (!ui.genOpts.hidden) ui.entryPassword.value = generatePassword();
-  };
-  ui.genLower.onchange = () => {
-    if (!ui.genOpts.hidden) ui.entryPassword.value = generatePassword();
-  };
-  ui.genDigits.onchange = () => {
-    if (!ui.genOpts.hidden) ui.entryPassword.value = generatePassword();
-  };
-  ui.genSym.onchange = () => {
-    if (!ui.genOpts.hidden) ui.entryPassword.value = generatePassword();
-  };
-  ui.btnTogglePass.onclick = () => {
-    ui.entryPassword.type = ui.entryPassword.type === 'password' ? 'text' : 'password';
-  };
-  ui.btnCopyPass.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(ui.entryPassword.value);
-      setStatusLine('Пароль скопирован');
-      setTimeout(() => setStatusLine(''), 1000);
-    } catch (_) {}
-  };
-  ui.btnResetClose.onclick = () => ui.modalReset.close();
-  ui.btnResetCancel.onclick = () => ui.modalReset.close();
-  ui.inputResetConfirm.oninput = () => {
-    ui.btnResetConfirm.disabled = ui.inputResetConfirm.value.trim() !== 'RESET';
-  };
-  ui.formReset.onsubmit = (e) => {
-    e.preventDefault();
-    resetDevice();
-  };
+  }
 
-  init();
+  async function openView(id) {
+    const st = el('appStatus');
+    hideStatus(st);
+    state.viewId = id;
+    const body = el('viewBody');
+    body.textContent = '';
+    el('btnViewTotp').hidden = true;
+    stopTotpTimer();
+    let d;
+    try {
+      const r = await api(`/api/entries/${id}`);
+      d = r.data;
+    } catch (e) {
+      statusOf(st, 'error', `Не удалось открыть запись: ${errMsg(e.code)}`);
+      return;
+    }
+    el('viewTitle').textContent = d.title || '(без названия)';
+
+    const row = (label, value, mono) => {
+      if (!value) {
+        return;
+      }
+      const wrap = h('div', 'view-row');
+      wrap.appendChild(h('div', 'view-row__label', label));
+      wrap.appendChild(h('p', `view-row__value${mono ? ' view-row__value--mono' : ''}`, value));
+      body.appendChild(wrap);
+    };
+
+    row('Логин', d.login, true);
+    if (d.hasPassword) {
+      const wrap = h('div', 'view-row');
+      wrap.appendChild(h('div', 'view-row__label', 'Пароль'));
+      const val = h('p', 'view-row__value view-row__value--mono', '••••••••••••');
+      wrap.appendChild(val);
+      const actions = h('div', 'view-actions');
+      const bReveal = h('button', 'btn btn--ghost btn--sm', 'Показать пароль');
+      bReveal.type = 'button';
+      bReveal.addEventListener('click', async () => {
+        try {
+          const r = await api(`/api/entries/${id}/secret`);
+          val.textContent = r.data.password || '';
+          bReveal.remove();
+          const bCopy = h('button', 'btn btn--ghost btn--sm', 'Скопировать');
+          bCopy.type = 'button';
+          bCopy.addEventListener('click', () => copyText(r.data.password || '', bCopy));
+          actions.appendChild(bCopy);
+        } catch (e2) {
+          statusOf(st, 'error', errMsg(e2.code));
+        }
+      });
+      actions.appendChild(bReveal);
+      wrap.appendChild(actions);
+      body.appendChild(wrap);
+    }
+    if (d.url) {
+      const wrap = h('div', 'view-row');
+      wrap.appendChild(h('div', 'view-row__label', 'URL'));
+      const a = h('a', 'view-row__value', d.url);
+      a.href = d.url;
+      a.rel = 'noopener noreferrer';
+      a.target = '_blank';
+      wrap.appendChild(a);
+      body.appendChild(wrap);
+    }
+    const tagList = (d.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
+    if (tagList.length) {
+      const wrap = h('div', 'view-row');
+      wrap.appendChild(h('div', 'view-row__label', 'Теги'));
+      const badges = h('div', 'entry-card__badges');
+      for (const t of tagList) {
+        badges.appendChild(h('span', 'badge', t));
+      }
+      wrap.appendChild(badges);
+      body.appendChild(wrap);
+    }
+    row('Заметки', d.note, false);
+
+    const totpBox = h('div', 'totp-box');
+    totpBox.hidden = true;
+    const totpCode = h('span', 'totp-code', '------');
+    const totpMeta = h('span', 'totp-meta', '');
+    totpBox.appendChild(totpCode);
+    totpBox.appendChild(totpMeta);
+    body.appendChild(totpBox);
+
+    if (d.hasTotp) {
+      el('btnViewTotp').hidden = false;
+      el('btnViewTotp').onclick = () => {
+        if (totpBox.hidden) {
+          totpBox.hidden = false;
+          refreshTotp(id, totpCode, totpMeta);
+        } else {
+          totpBox.hidden = true;
+          stopTotpTimer();
+        }
+      };
+      state.totpBox = totpBox;
+    }
+
+    el('modalView').showModal();
+  }
+
+  function stopTotpTimer() {
+    if (state.totpTimer) {
+      clearInterval(state.totpTimer);
+      state.totpTimer = null;
+    }
+  }
+
+  function refreshTotp(id, codeNode, metaNode) {
+    stopTotpTimer();
+    let left = 0;
+    const tick = async () => {
+      if (left <= 0) {
+        try {
+          const r = await api(`/api/entries/${id}/totp?t=${Math.floor(Date.now() / 1000)}`);
+          codeNode.textContent = r.data.code || '------';
+          left = r.data.expiresInSec || 30;
+        } catch (e) {
+          codeNode.textContent = '------';
+          metaNode.textContent = errMsg(e.code);
+          stopTotpTimer();
+          return;
+        }
+      }
+      left -= 1;
+      metaNode.textContent = `обновится через ${Math.max(left, 0)} с`;
+    };
+    tick();
+    state.totpTimer = setInterval(tick, 1000);
+  }
+
+  async function rekeyGenPhrase() {
+    const btn = el('btnRekeyGen');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/auth/password');
+      el('inputRekeyPassword').value = r.data.password || '';
+      el('inputRekeyPassword').type = 'text';
+      el('btnRekeyToggle').textContent = 'Скрыть';
+    } catch (e) {
+      statusOf(el('rekeyStatus'), 'error', errMsg(e.code));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function rekeyKeyfileHint() {
+    const hasFile = el('inputRekeyKeyfile').files && el('inputRekeyKeyfile').files.length > 0;
+    let text;
+    if (state.keyfileRequired && hasFile) {
+      text = 'Файл останется обязателен при входе.';
+    } else if (state.keyfileRequired && !hasFile) {
+      text = 'Сейчас вход с файлом. Файл не выбран — после смены вход будет только по паролю.';
+    } else if (!state.keyfileRequired && hasFile) {
+      text = 'После смены вход будет требовать этот файл.';
+    } else {
+      text = 'Вход по паролю без файла — как сейчас.';
+    }
+    el('rekeyKeyfileHint').textContent = text;
+  }
+
+  async function doRekey(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('rekeyStatus');
+    hideStatus(st);
+    const pw = el('inputRekeyPassword').value;
+    if (!pw) {
+      statusOf(st, 'error', 'Введите новый мастер-пароль');
+      return;
+    }
+    if (pw.length < 12) {
+      statusOf(st, 'error', 'Мастер-пароль должен быть не короче 12 символов');
+      return;
+    }
+    const btn = el('btnRekeySubmit');
+    btn.disabled = true;
+    try {
+      const kf = await readKeyfile(el('inputRekeyKeyfile'), state.keyFileMaxBytes);
+      const body = { password: pw };
+      if (!kf.absent) {
+        body.keyfile = kf.b64;
+      }
+      await submitJob('/api/auth/rekey', body);
+      await fetchState();
+      statusOf(st, 'ok', 'Мастер-пароль изменён. Хранилище перешифровано.');
+      el('inputRekeyPassword').value = '';
+      updateFooter();
+      setTimeout(() => {
+        el('modalRekey').close();
+      }, 1200);
+    } catch (err) {
+      statusOf(st, 'error', errMsg(err.code));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function doExport() {
+    const st = el('appStatus');
+    hideStatus(st);
+    try {
+      const r = await api('/api/export');
+      const text = JSON.stringify(r.data, null, 2);
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      a.href = url;
+      a.download = `passmanager-${stamp}.pmx1.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      statusOf(st, 'ok', `Выгружено записей: ${r.data.count}`);
+    } catch (e) {
+      statusOf(st, 'error', `Экспорт не удался: ${errMsg(e.code)}`);
+    }
+  }
+
+  async function doImport(file) {
+    const st = el('appStatus');
+    hideStatus(st);
+    if (!file) {
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      statusOf(st, 'error', 'Файл не является корректным JSON');
+      return;
+    }
+    if (!parsed || parsed.format !== 'PMX1' || parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+      statusOf(st, 'error', 'Файл не в формате PMX1 версии 1');
+      return;
+    }
+    const all = parsed.entries;
+    if (all.length === 0) {
+      statusOf(st, 'warn', 'В файле нет записей');
+      return;
+    }
+    try {
+      const imported = await importChunks(all, (done, total) =>
+        statusOf(st, 'warn', `Импорт: ${done} из ${total}…`)
+      );
+      statusOf(st, 'ok', `Импортировано записей: ${imported} из ${all.length}`);
+      await loadEntries();
+    } catch (e) {
+      statusOf(st, 'error', `Импорт прерван: ${errMsg(e.code)}. Уже добавлено: ${e.imported | 0}`);
+      await loadEntries();
+    }
+  }
+
+  async function importChunks(all, onProgress) {
+    let imported = 0;
+    for (let i = 0; i < all.length; i += IMPORT_BATCH) {
+      const chunk = all.slice(i, i + IMPORT_BATCH);
+      if (onProgress) {
+        onProgress(Math.min(i + chunk.length, all.length), all.length);
+      }
+      try {
+        const r = await api('/api/import', {
+          method: 'POST',
+          body: { format: 'PMX1', version: 1, entries: chunk },
+        });
+        imported += r.data.imported | 0;
+      } catch (e) {
+        e.imported = imported;
+        throw e;
+      }
+    }
+    return imported;
+  }
+
+  async function doReset(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('resetStatus');
+    hideStatus(st);
+    const btn = el('btnResetConfirm');
+    btn.disabled = true;
+    try {
+      await submitJob('/api/auth/reset', { confirm: 'RESET' });
+      saveSession('');
+      el('inputResetConfirm').value = '';
+      el('modalReset').close();
+      await fetchState();
+      showScreen('setup');
+      updateFooter();
+      statusOf(el('setupStatus'), 'ok', 'Устройство сброшено. Создайте новое хранилище.');
+    } catch (err) {
+      // session_required уже отработал через handleSessionExpired(): модалка
+      // закрыта, сообщение показано на экране разблокировки — дублировать его
+      // в закрытой модалке не нужно.
+      if (err.code !== 'session_required') {
+        statusOf(st, 'error', errMsg(err.code));
+      }
+      btn.disabled = el('inputResetConfirm').value !== 'RESET';
+    } finally {
+      if (el('modalReset').open) {
+        btn.disabled = el('inputResetConfirm').value !== 'RESET';
+      }
+    }
+  }
+
+  const KDBX_LIMITS = { title: 47, login: 95, password: 159, url: 191, note: 399, tags: 127 };
+  const KDBX_KEYFILE_MAX = 1048576;
+
+  let kdbxLibPromise = null;
+
+  function ensureKdbx() {
+    if (!kdbxLibPromise) {
+      kdbxLibPromise = new Promise((resolve, reject) => {
+        const fail = () => {
+          kdbxLibPromise = null;
+          reject(new ApiError(0, 'kdbx_load_failed'));
+        };
+        const s1 = document.createElement('script');
+        s1.src = 'kdbxweb.min.js';
+        s1.onload = () => {
+          const s2 = document.createElement('script');
+          s2.src = 'kdbx-shim.js';
+          s2.onload = () => {
+            if (!window.kdbxweb || !window.kdbxweb.Kdbx) {
+              fail();
+              return;
+            }
+            resolve(window.kdbxweb);
+          };
+          s2.onerror = fail;
+          document.head.appendChild(s2);
+        };
+        s1.onerror = fail;
+        document.head.appendChild(s1);
+      });
+    }
+    return kdbxLibPromise;
+  }
+
+  function kdbxWalkEntries(group, path, acc) {
+    (group.entries || []).forEach((entry) => acc.push({ entry, path }));
+    (group.groups || []).forEach((g) => {
+      kdbxWalkEntries(g, path.concat([String(g.name || '')]), acc);
+    });
+  }
+
+  function kdbxField(fields, key) {
+    const v = fields.get(key);
+    if (v == null) {
+      return '';
+    }
+    if (typeof v === 'string') {
+      return v;
+    }
+    if (typeof v.getText === 'function') {
+      return v.getText();
+    }
+    return '';
+  }
+
+  function kdbxToPmx(db) {
+    const found = [];
+    kdbxWalkEntries(db.getDefaultGroup(), [], found);
+    const entries = [];
+    const skipped = [];
+    let truncated = 0;
+    for (const item of found) {
+      const f = item.entry.fields;
+      const title = kdbxField(f, 'Title');
+      const login = kdbxField(f, 'UserName');
+      const password = kdbxField(f, 'Password');
+      const url = kdbxField(f, 'URL');
+      let note = kdbxField(f, 'Notes');
+      const tagParts = kdbxField(f, 'Tags')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const pathTag = item.path.filter(Boolean).join('/');
+      if (pathTag) {
+        tagParts.push(pathTag);
+      }
+      let tags = tagParts.join(',');
+      const over = [];
+      if (title.length > KDBX_LIMITS.title) {
+        over.push('заголовок');
+      }
+      if (login.length > KDBX_LIMITS.login) {
+        over.push('логин');
+      }
+      if (password.length > KDBX_LIMITS.password) {
+        over.push('пароль');
+      }
+      if (url.length > KDBX_LIMITS.url) {
+        over.push('URL');
+      }
+      if (over.length) {
+        skipped.push({ title: title || login || url || '(без имени)', reason: over.join(', ') });
+        continue;
+      }
+      if (note.length > KDBX_LIMITS.note) {
+        note = note.slice(0, KDBX_LIMITS.note);
+        truncated += 1;
+      }
+      if (tags.length > KDBX_LIMITS.tags) {
+        tags = tags.slice(0, KDBX_LIMITS.tags);
+      }
+      const finalTitle = title || login || url || '(без имени)';
+      if (!title && !login && !password && !url && !note && !tags) {
+        skipped.push({ title: '(пустая запись)', reason: 'пустая' });
+        continue;
+      }
+      let totp = '';
+      const otp = kdbxField(f, 'otp');
+      if (otp) {
+        const secret = otp.indexOf('otpauth://') === 0
+          ? (function () {
+              try {
+                return new URL(otp).searchParams.get('secret') || '';
+              } catch (err) {
+                return '';
+              }
+            })()
+          : otp;
+        const norm = secret.toUpperCase();
+        if (BASE32_RE.test(norm)) {
+          totp = norm;
+        }
+      }
+      entries.push({ title: finalTitle, login, password, url, note, tags, totp });
+    }
+    return { entries, skipped, truncated };
+  }
+
+  const kdbxImportState = { entries: [], skipped: [], truncated: 0, phase: 1 };
+
+  function kdbxImportPhase(n) {
+    kdbxImportState.phase = n;
+    el('kdbxImportPhase1').hidden = n !== 1;
+    el('kdbxImportPhase2').hidden = n !== 2;
+    el('btnKdbxImportBack').hidden = n !== 2;
+    const next = el('btnKdbxImportNext');
+    if (n === 1) {
+      next.textContent = 'Открыть базу';
+      next.disabled = false;
+    } else {
+      const cnt = kdbxImportState.entries.length;
+      next.textContent = `Импортировать (${cnt})`;
+      next.disabled = cnt === 0;
+    }
+  }
+
+  function kdbxImportReset() {
+    kdbxImportState.entries = [];
+    kdbxImportState.skipped = [];
+    kdbxImportState.truncated = 0;
+    el('inputKdbxFile').value = '';
+    el('inputKdbxPassword').value = '';
+    el('inputKdbxKeyfile').value = '';
+    el('kdbxImportList').textContent = '';
+    hideStatus(el('kdbxImportStatus'));
+    hideStatus(el('kdbxImportStatus2'));
+    kdbxImportPhase(1);
+  }
+
+  async function kdbxOpenPreview() {
+    const st = el('kdbxImportStatus');
+    hideStatus(st);
+    const file = el('inputKdbxFile').files[0];
+    if (!file) {
+      statusOf(st, 'error', errMsg('kdbx_no_file'));
+      return;
+    }
+    const pw = el('inputKdbxPassword').value;
+    const kfFile = el('inputKdbxKeyfile').files[0];
+    const btn = el('btnKdbxImportNext');
+    btn.disabled = true;
+    statusOf(st, 'warn', 'Открытие базы… KDF может занять несколько секунд');
+    try {
+      const K = await ensureKdbx();
+      let kfBuf;
+      if (kfFile) {
+        if (kfFile.size > KDBX_KEYFILE_MAX) {
+          throw new ApiError(400, 'kdbx_open_failed');
+        }
+        kfBuf = await kfFile.arrayBuffer();
+      }
+      const creds = new K.Credentials(K.ProtectedValue.fromString(pw), kfBuf);
+      const buf = await file.arrayBuffer();
+      const db = await K.Kdbx.load(buf, creds);
+      const res = kdbxToPmx(db);
+      kdbxImportState.entries = res.entries;
+      kdbxImportState.skipped = res.skipped;
+      kdbxImportState.truncated = res.truncated;
+      const summary = [`Найдено записей: ${res.entries.length}`];
+      if (res.truncated) {
+        summary.push(`заметок усечено до ${KDBX_LIMITS.note} симв.: ${res.truncated}`);
+      }
+      el('kdbxImportSummary').textContent = summary.join(' · ');
+      const list = el('kdbxImportList');
+      list.textContent = '';
+      res.entries.slice(0, 30).forEach((item) => {
+        const b = document.createElement('span');
+        b.className = 'badge';
+        b.textContent = item.title;
+        list.appendChild(b);
+      });
+      if (res.entries.length > 30) {
+        const b = document.createElement('span');
+        b.className = 'badge';
+        b.textContent = `…ещё ${res.entries.length - 30}`;
+        list.appendChild(b);
+      }
+      const skip = el('kdbxImportSkip');
+      if (res.skipped.length) {
+        const detail = res.skipped
+          .slice(0, 5)
+          .map((s) => `${s.title} — ${s.reason}`)
+          .join('; ');
+        skip.hidden = false;
+        skip.textContent = `Пропущено записей: ${res.skipped.length}${res.skipped.length > 5 ? '' : ` (${detail})`}. Причина: поле длиннее лимита хранилища.`;
+      } else {
+        skip.hidden = true;
+        skip.textContent = '';
+      }
+      hideStatus(st);
+      kdbxImportPhase(2);
+      if (res.entries.length === 0 && res.skipped.length === 0) {
+        statusOf(el('kdbxImportStatus2'), 'warn', 'В базе нет записей');
+      }
+    } catch (err) {
+      statusOf(
+        st,
+        'error',
+        err instanceof ApiError && err.code !== 'kdbx_open_failed'
+          ? errMsg(err.code)
+          : errMsg('kdbx_open_failed')
+      );
+      kdbxImportState.entries = [];
+      btn.disabled = false;
+    }
+  }
+
+  async function kdbxDoImport() {
+    const st = el('kdbxImportStatus2');
+    hideStatus(st);
+    const all = kdbxImportState.entries;
+    if (!all.length) {
+      return;
+    }
+    const btn = el('btnKdbxImportNext');
+    btn.disabled = true;
+    try {
+      const imported = await importChunks(all, (done, total) =>
+        statusOf(st, 'warn', `Импорт: ${done} из ${total}…`)
+      );
+      statusOf(st, 'ok', `Импортировано: ${imported} из ${all.length}`);
+      await loadEntries();
+      setTimeout(() => el('modalKdbxImport').close(), 1200);
+    } catch (e) {
+      statusOf(st, 'error', `Импорт прерван: ${errMsg(e.code)}. Уже добавлено: ${e.imported | 0}`);
+      btn.disabled = false;
+      await loadEntries();
+    }
+  }
+
+  async function doExportKdbx(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('kdbxExportStatus');
+    hideStatus(st);
+    const pw = el('inputKdbxExportPassword').value;
+    if (!pw) {
+      statusOf(st, 'error', errMsg('kdbx_no_password'));
+      return;
+    }
+    const btn = el('btnKdbxExportSubmit');
+    btn.disabled = true;
+    statusOf(st, 'warn', 'Формирование файла…');
+    try {
+      const K = await ensureKdbx();
+      const r = await api('/api/export');
+      const pmx = r.data || {};
+      const creds = new K.Credentials(K.ProtectedValue.fromString(pw));
+      const db = K.Kdbx.create(creds, '/PassManager');
+      const root = db.getDefaultGroup();
+      const items = Array.isArray(pmx.entries) ? pmx.entries : [];
+      for (const it of items) {
+        const en = db.createEntry(root);
+        en.fields.set('Title', it.title || '');
+        en.fields.set('UserName', it.login || '');
+        en.fields.set('Password', K.ProtectedValue.fromString(it.password || ''));
+        en.fields.set('URL', it.url || '');
+        en.fields.set('Notes', it.note || '');
+        if (it.tags) {
+          en.fields.set('Tags', it.tags);
+        }
+        if (it.totp) {
+          en.fields.set(
+            'otp',
+            `otpauth://totp/${encodeURIComponent(it.title || 'entry')}?secret=${it.totp}&digits=6&period=30`
+          );
+        }
+      }
+      const saved = await db.save();
+      const blob = new Blob([saved], { type: 'application/x-keepass2' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'passmanager.kdbx';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      statusOf(st, 'ok', `Файл .kdbx сформирован: ${items.length} записей`);
+      el('inputKdbxExportPassword').value = '';
+      setTimeout(() => el('modalKdbxExport').close(), 1000);
+    } catch (err) {
+      statusOf(
+        st,
+        'error',
+        err instanceof ApiError && err.code !== 'kdbx_make_failed' && !err.code.startsWith('http_')
+          ? errMsg(err.code)
+          : errMsg('kdbx_make_failed')
+      );
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function wire() {
+    el('btnProvision').addEventListener('click', doProvision);
+    el('btnCopyMaster').addEventListener('click', () => copyText(state.masterShown, el('btnCopyMaster')));
+    el('btnHideMaster').addEventListener('click', toggleMaster);
+    el('btnDoneMaster').addEventListener('click', async () => {
+      el('masterBlock').hidden = true;
+      state.masterShown = '';
+      el('masterPassword').value = '';
+      await enterApp();
+    });
+
+    el('formUnlock').addEventListener('submit', doUnlock);
+    el('btnUnlockRetry').addEventListener('click', boot);
+
+    el('btnLock').addEventListener('click', doLock);
+    el('btnRefresh').addEventListener('click', loadEntries);
+    el('btnNew').addEventListener('click', () => openEdit(null));
+    el('searchInput').addEventListener('input', render);
+
+    el('btnExport').addEventListener('click', doExport);
+    el('inputImportFile').addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      doImport(file);
+    });
+
+    el('btnEntryClose').addEventListener('click', () => el('modalEntry').close());
+    el('btnEntryCancel').addEventListener('click', () => el('modalEntry').close());
+    el('formEntry').addEventListener('submit', saveEntry);
+    el('btnEntryDelete').addEventListener('click', deleteEntry);
+    el('btnGenPass').addEventListener('click', () => {
+      el('genOpts').hidden = false;
+      el('entryPassword').value = generatePassword();
+      el('entryPassword').type = 'text';
+      el('btnTogglePass').textContent = 'Скрыть';
+    });
+    for (const id of ['genUpper', 'genLower', 'genDigits', 'genSym', 'genLen']) {
+      el(id).addEventListener('input', () => {
+        el('genLenVal').textContent = el('genLen').value;
+        if (!el('genOpts').hidden) {
+          el('entryPassword').value = generatePassword();
+        }
+      });
+    }
+    el('btnGenPhrase').addEventListener('click', async () => {
+      const btn = el('btnGenPhrase');
+      btn.disabled = true;
+      try {
+        const r = await api('/api/auth/password');
+        el('entryPassword').value = r.data.password || '';
+        el('entryPassword').type = 'text';
+        el('btnTogglePass').textContent = 'Скрыть';
+      } catch (e) {
+        statusOf(el('appStatus'), 'error', errMsg(e.code));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    el('btnTogglePass').addEventListener('click', () => {
+      const inp = el('entryPassword');
+      if (inp.type === 'password') {
+        inp.type = 'text';
+        el('btnTogglePass').textContent = 'Скрыть';
+      } else {
+        inp.type = 'password';
+        el('btnTogglePass').textContent = 'Показать';
+      }
+    });
+    el('btnCopyPass').addEventListener('click', () => copyText(el('entryPassword').value, el('btnCopyPass')));
+
+    el('btnViewClose').addEventListener('click', () => el('modalView').close());
+    el('btnViewClose2').addEventListener('click', () => el('modalView').close());
+    el('btnViewEdit').addEventListener('click', () => {
+      const id = state.viewId;
+      el('modalView').close();
+      openEdit(id);
+    });
+    el('modalView').addEventListener('close', () => {
+      stopTotpTimer();
+      el('viewBody').textContent = '';
+      state.viewId = null;
+    });
+
+    el('btnRekey').addEventListener('click', () => {
+      el('inputRekeyPassword').value = '';
+      el('inputRekeyPassword').type = 'password';
+      el('btnRekeyToggle').textContent = 'Показать';
+      el('inputRekeyKeyfile').value = '';
+      hideStatus(el('rekeyStatus'));
+      rekeyKeyfileHint();
+      el('modalRekey').showModal();
+    });
+    el('inputRekeyKeyfile').addEventListener('change', rekeyKeyfileHint);
+    el('btnRekeyClose').addEventListener('click', () => el('modalRekey').close());
+    el('btnRekeyCancel').addEventListener('click', () => el('modalRekey').close());
+    el('formRekey').addEventListener('submit', doRekey);
+    el('btnRekeyGen').addEventListener('click', rekeyGenPhrase);
+    el('btnRekeyToggle').addEventListener('click', () => {
+      const inp = el('inputRekeyPassword');
+      if (inp.type === 'password') {
+        inp.type = 'text';
+        el('btnRekeyToggle').textContent = 'Скрыть';
+      } else {
+        inp.type = 'password';
+        el('btnRekeyToggle').textContent = 'Показать';
+      }
+    });
+
+    el('btnReset').addEventListener('click', () => {
+      el('inputResetConfirm').value = '';
+      el('btnResetConfirm').disabled = true;
+      hideStatus(el('resetStatus'));
+      el('modalReset').showModal();
+    });
+    el('inputResetConfirm').addEventListener('input', (e) => {
+      el('btnResetConfirm').disabled = e.target.value !== 'RESET';
+    });
+    el('btnResetClose').addEventListener('click', () => el('modalReset').close());
+    el('btnResetCancel').addEventListener('click', () => el('modalReset').close());
+    el('formReset').addEventListener('submit', doReset);
+
+    el('btnExportKdbx').addEventListener('click', () => {
+      el('inputKdbxExportPassword').value = '';
+      hideStatus(el('kdbxExportStatus'));
+      el('modalKdbxExport').showModal();
+    });
+    el('btnKdbxExportClose').addEventListener('click', () => el('modalKdbxExport').close());
+    el('btnKdbxExportCancel').addEventListener('click', () => el('modalKdbxExport').close());
+    el('formKdbxExport').addEventListener('submit', doExportKdbx);
+    el('btnKdbxExportGen').addEventListener('click', () => {
+      el('inputKdbxExportPassword').value = generatePassword();
+    });
+    el('btnKdbxExportToggle').addEventListener('click', () => {
+      const inp = el('inputKdbxExportPassword');
+      const show = inp.type === 'password';
+      inp.type = show ? 'text' : 'password';
+      el('btnKdbxExportToggle').textContent = show ? 'Скрыть' : 'Показать';
+    });
+
+    el('inputImportKdbxFile').addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file) {
+        return;
+      }
+      kdbxImportReset();
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      el('inputKdbxFile').files = dt.files;
+      el('modalKdbxImport').showModal();
+      el('inputKdbxPassword').focus();
+    });
+    el('btnKdbxImportClose').addEventListener('click', () => el('modalKdbxImport').close());
+    el('btnKdbxImportCancel').addEventListener('click', () => el('modalKdbxImport').close());
+    el('btnKdbxImportBack').addEventListener('click', () => kdbxImportPhase(1));
+    el('formKdbxImport').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      if (kdbxImportState.phase === 1) {
+        kdbxOpenPreview();
+      } else {
+        kdbxDoImport();
+      }
+    });
+    el('modalKdbxImport').addEventListener('close', kdbxImportReset);
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    wire();
+    boot();
+  });
 })();

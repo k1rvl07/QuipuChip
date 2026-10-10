@@ -42,6 +42,14 @@
 // выглядит валидной ни для одного заголовка. Если пропало после переключения,
 // новая область уже целиком записана. Старая область стирается при следующей
 // компакции, а не сразу — это позволяет не терять данные и в этом случае тоже.
+//
+// Ключевой файл. Пароль и SHA-256 ключевого файла склеиваются в единый
+// материал KDF (g_password/g_passwordLen), поэтому вывод ключа одинаков
+// независимо от того, откуда пришли байты, а формат заголовка не изменился:
+// без файла буфер и длина в точности равны строке пароля, и старые
+// хранилища открываются как раньше. Наличие файла отражено флагом
+// kFlagKeyfile в заголовке — он нужен UI (keyFileRequired()), а сам по себе
+// не защищает: без самого файла ключ не выйдет, и тег не сойдётся.
 
 
 #include "vault.h"
@@ -130,6 +138,10 @@ constexpr size_t kHdrSlot1 = config::kVaultHeaderSlotBytes;
 
 constexpr uint32_t kFlagProvisioned = 1u << 0;
 constexpr uint32_t kFlagCompacted = 1u << 1;
+// Хранилище открыто/провижинено с ключевым файлом. Входит в flags, то есть НЕ
+// в AAD (flags обнуляются в buildAad) — подделать его можно, но это меняет
+// лишь подсказку UI: без самого файла ключ не выйдет, и тег не сойдётся.
+constexpr uint32_t kFlagKeyfile = 1u << 2;
 
 constexpr size_t kRecFixed = 4 + 2 + crypto::kGcmIvLen + crypto::kGcmTagLen;  // 34
 constexpr uint8_t kSentinel[] = "PMV1-OK";
@@ -182,10 +194,19 @@ int g_region = 0;                              // активная област�
 // Номер записи заголовка. Растёт при каждом сохранении; младший бит выбирает
 // слот, поэтому предыдущая копия заголовка остаётся нетронутой резервной.
 uint32_t g_hdrSeq = 0;
-// Пароль, которым открыли. Нужен только на время опроса обоих слотов
-// заголовков: каждый проверяется своим ключом, а ключ выводится из соли в самом
-// слоте. Живёт в DRAM не дольше begin() — см. PasswordGuard.
-char g_password[config::kMaxPassChars] = {};
+// Материал KDF: байты пароля и, при наличии ключевого файла, его SHA-256 (не
+// NUL-терминирован, длина в g_passwordLen). В begin() нужен только на время
+// опроса обоих слотов заголовков: каждый проверяется своим ключом, а ключ
+// выводится из соли в самом слоте; clear()/rekey() собирают в этот же буфер
+// материал нового пароля. Везде буфер стирается сразу после вывода ключа
+// (PasswordGuard, wipe в clear/rekey). Без ключевого файла буфер и длина в
+// точности равны строке пароля — так открывают все хранилища, созданные без
+// файловой поддержки.
+char g_password[config::kMaxPassChars + 32] = {};
+size_t g_passwordLen = 0;
+// Был ли ключевой файл при текущем открытии/провижининге — попадает в флаги
+// заголовка. Сам файл здесь не хранится (и вообще нигде не хранится).
+bool g_keyFileFlag = false;
 uint32_t g_nextId = 1;
 bool g_compactedOnce = false;
 
@@ -268,8 +289,11 @@ void removeAt(uint32_t slot) {
   --g_live;
 }
 
+// Поля лежат в payload подряд, каждое NUL-терминировано: title, login,
+// password, url, note, tags, totp. Порядок фиксирован, NUL — разделитель.
 size_t serialize(const Entry& e, uint8_t* out, size_t outLen) {
-  const char* fields[] = {e.title, e.login, e.password, e.url, e.note};
+  const char* fields[] = {e.title, e.login, e.password, e.url, e.note, e.tags,
+                          e.totp};
   size_t n = 0;
   for (const char* f : fields) {
     const size_t len = std::strlen(f) + 1;
@@ -282,14 +306,20 @@ size_t serialize(const Entry& e, uint8_t* out, size_t outLen) {
   return n;
 }
 
+// Читает поля до конца payload. Записи, созданные до v0.2.0, несут пять
+// полей: pos доходит до len, остановка по `pos >= len`, и tags/totp остаются
+// пустыми из-за memset. Обратное (новая запись на старой прошивке) откатом не
+// поддерживается — старый scanLog вернёт Tampered, а не порчу данных.
 void deserialize(uint32_t id, const uint8_t* in, size_t len, Entry& e) {
   std::memset(&e, 0, sizeof(e));
   e.id = id;
-  char* fields[] = {e.title, e.login, e.password, e.url, e.note};
+  char* fields[] = {e.title, e.login, e.password, e.url, e.note, e.tags,
+                    e.totp};
   const size_t caps[] = {sizeof(e.title), sizeof(e.login), sizeof(e.password),
-                         sizeof(e.url), sizeof(e.note)};
+                         sizeof(e.url),    sizeof(e.note),   sizeof(e.tags),
+                         sizeof(e.totp)};
   size_t pos = 0;
-  for (size_t f = 0; f < 5; ++f) {
+  for (size_t f = 0; f < 7; ++f) {
     if (pos >= len) {
       break;
     }
@@ -393,7 +423,8 @@ void buildHdr() {
   put32(g_hdr + kHdrLiveBytes, static_cast<uint32_t>(g_livePayload));
   put32(g_hdr + kHdrUsedBytes, static_cast<uint32_t>(g_usedEnd));
   put32(g_hdr + kHdrFlags,
-        kFlagProvisioned | (g_compactedOnce ? kFlagCompacted : 0u));
+        kFlagProvisioned | (g_compactedOnce ? kFlagCompacted : 0u) |
+            (g_keyFileFlag ? kFlagKeyfile : 0u));
   put32(g_hdr + kHdrIters, g_iters);
   std::memcpy(g_hdr + kHdrSaltPw, g_saltPw, sizeof(g_saltPw));
   std::memcpy(g_hdr + kHdrSaltDev, g_saltDev, sizeof(g_saltDev));
@@ -553,6 +584,47 @@ bool probeProvisioned() {
   return false;
 }
 
+// Требует ли вход ключевой файл. Читается заголовок с наибольшим seq среди
+// полностью записанных (маркер kCommitMagic дописывается последним, поэтому
+// у оборванной записи его нет) — ровно тот слот, который begin() выберет по
+// тегу и из которого он сам переносит флаг в g_keyFileFlag.
+//
+// Прежний обход «любого из двух слотов» после rekey с файла на пароль без
+// файла отдавал true: оставшийся в соседнем слоте старый заголовок — не
+// актуальное состояние. UI показывал поле ключевого файла, которого вход уже
+// не требует: пустое поле работало, а введённый по подсказке файл давал
+// wrong_password. Тот же довод, что и у probeProvisioned(): без пароля
+// аутентифицировать флаг нельзя, а подделка меняет лишь подсказку UI — без
+// самого файла ключ не выйдет. Нужен, чтобы показать поле ключевого файла в
+// форме до ввода пароля.
+bool probeKeyFileFlag() {
+  ensurePartition();
+  if (!g_part) {
+    return false;
+  }
+  uint8_t raw[config::kVaultHeaderBytes];
+  bool found = false;
+  uint32_t bestSeq = 0;
+  bool bestFlag = false;
+  for (size_t slot = 0; slot < 2; ++slot) {
+    const size_t off = slot * config::kFlashSectorBytes;
+    if (!readRange(off, raw, sizeof(raw))) {
+      continue;
+    }
+    if (std::memcmp(raw + kHdrMagic, config::kVaultMagic, 4) != 0 ||
+        get32(raw + kHdrCommit) != kCommitMagic) {
+      continue;
+    }
+    const uint32_t seq = get32(raw + kHdrSeq);
+    if (!found || seq > bestSeq) {
+      found = true;
+      bestSeq = seq;
+      bestFlag = (get32(raw + kHdrFlags) & kFlagKeyfile) != 0;
+    }
+  }
+  return bestFlag;
+}
+
 void publishSnapshot() {
   portENTER_CRITICAL(&g_snapMux);
   g_snap.state = g_ready ? State::Unlocked : (g_provisioned ? State::Locked
@@ -622,6 +694,8 @@ void close() {
   // оставить в памяти то, что нужно для следующего begin().
   crypto::wipe(g_key, sizeof(g_key));
   crypto::wipe(g_password, sizeof(g_password));
+  g_passwordLen = 0;
+  g_keyFileFlag = false;
   crypto::wipe(g_hdr, sizeof(g_hdr));
   crypto::wipe(g_saltPw, sizeof(g_saltPw));
   crypto::wipe(g_saltDev, sizeof(g_saltDev));
@@ -654,6 +728,11 @@ bool provisioned() {
   return probeProvisioned();
 }
 
+bool keyFileRequired() {
+  const Guard guard;
+  return probeKeyFileFlag();
+}
+
 void initialize() {
   // Создание мьютекса здесь, а не лениво в ensureMutex(): ленивая инициализация
   // без защиты — гонка, когда два потока впервые входят в vault одновременно и
@@ -680,12 +759,42 @@ const Stats& stats() {
 
 namespace {
 
-// Выводит KEK из пароля и device-фактора. Соль device-фактора берётся из
+// Собирает материал KDF (пароль, за ним — SHA-256 ключевого файла) в buf.
+// Возвращает длину в байтах или 0 при ошибке (nullptr, пароль длиннее
+// kMaxPassChars, нехватка места, сбой SHA-256). Без ключевого файла результат
+// в точности равен строке пароля — это обязано сохраняться, иначе старые
+// хранилища перестанут открываться.
+size_t buildMaterial(char* buf, size_t bufSize, const char* password,
+                     const uint8_t* keyFile, size_t keyFileLen) {
+  if (!buf || !password) {
+    return 0;
+  }
+  const size_t pwLen = std::strlen(password);
+  if (pwLen >= config::kMaxPassChars || pwLen + 32 > bufSize) {
+    return 0;
+  }
+  std::memcpy(buf, password, pwLen);
+  if (keyFile && keyFileLen > 0) {
+    uint8_t h[32];
+    if (crypto::sha256(keyFile, keyFileLen, h) !=
+        static_cast<int>(crypto::CipherError::Ok)) {
+      crypto::wipe(h, sizeof(h));
+      return 0;
+    }
+    std::memcpy(buf + pwLen, h, 32);
+    crypto::wipe(h, sizeof(h));
+    return pwLen + 32;
+  }
+  return pwLen;
+}
+
+// Выводит KEK из материала KDF и device-фактора. Соль device-фактора берётся из
 // заголовка, поэтому между provisioning и открытием она одна и та же.
-VaultError deriveKey(const char* password, const uint8_t* saltDev, uint32_t iters) {
+VaultError deriveKey(const char* mat, size_t matLen, const uint8_t* saltDev,
+                     uint32_t iters) {
   uint8_t fromPw[crypto::kAesKeyLen] = {};
   uint8_t term[crypto::kAesKeyLen] = {};
-  const int rcPw = crypto::pbkdf2HmacSha256(password, std::strlen(password),
+  const int rcPw = crypto::pbkdf2HmacSha256(mat, matLen,
                                             g_saltPw, config::kPbkdf2SaltLen, iters,
                                             fromPw);
   if (rcPw != static_cast<int>(crypto::CipherError::Ok)) {
@@ -751,13 +860,21 @@ enum class SlotState {
   kAbsent,   // слот не записан: нет магии
   kTorn,     // магия есть, тег не записан — запись оборвалась
   kValid,    // тег сошёлся, слот пригоден
-  kInvalid,  // слот записан целиком, но тег не сошёлся — подмена или порча
+  kInvalid,  // структурно сломан: версия, итерации или поколение не читаются
+  kTagMismatch,  // структура цела, но тег не подтверждается данным паролем
 };
 
 // Осматривает слот заголовка. Различение состояний существенно: kAbsent и kTorn
-// допускают откат на другой слот, а kInvalid — нет. Без этого порча свежего
-// заголовка молча приводила к отдаче устаревшего слота, то есть к тихой потере
-// последней записи вместо отказа.
+// допускают откат на другой слот, а kInvalid и kTagMismatch — нет. Без этого
+// порча свежего заголовка молча приводила к отдаче устаревшего слота, то есть
+// к тихой потере последней записи вместо отказа.
+//
+// kTagMismatch отделён от kInvalid не ради косметики: сломанная структура и
+// чужой пароль — разные вещи, и путать их было ошибкой. Смена пароля оставляет
+// в резервном слоте копию, которую старый пароль открывает, а новый слот —
+// нет; при общем kInvalid это выглядело как «свежий слот порчен», и begin()
+// отдавал Tampered на простой ввод старого пароля после rekey — UI показывал
+// повреждение хранилища вместо неверного пароля.
 SlotState probeHeaderSlot(size_t slot, uint8_t* out) {
   if (!readRange(slot, out, config::kVaultHeaderBytes)) {
     return SlotState::kAbsent;
@@ -785,7 +902,7 @@ SlotState probeHeaderSlot(size_t slot, uint8_t* out) {
   uint8_t trial[crypto::kAesKeyLen] = {};
   uint8_t fromPw[crypto::kAesKeyLen] = {};
   if (device::factor(out + kHdrSaltDev, config::kPbkdf2SaltLen, trial)) {
-    const int rc = crypto::pbkdf2HmacSha256(g_password, std::strlen(g_password),
+    const int rc = crypto::pbkdf2HmacSha256(g_password, g_passwordLen,
                                             out + kHdrSaltPw, config::kPbkdf2SaltLen,
                                             iters, fromPw);
     if (rc == static_cast<int>(crypto::CipherError::Ok)) {
@@ -821,7 +938,7 @@ SlotState probeHeaderSlot(size_t slot, uint8_t* out) {
   }
   const bool ok = crypto::ctEqual(tag, out + kHdrCheck, crypto::kGcmTagLen);
   crypto::wipe(tag, sizeof(tag));
-  return ok ? SlotState::kValid : SlotState::kInvalid;
+  return ok ? SlotState::kValid : SlotState::kTagMismatch;
 }
 
 // Пересчитывает тег проверочного шифротекста и сверяет с заголовком. Шифротекст
@@ -936,7 +1053,8 @@ VaultError scanLog() {
 
 }  // namespace
 
-VaultError begin(const char* password) {
+VaultError begin(const char* password, const uint8_t* keyFile,
+                 size_t keyFileLen) {
   const Guard guard;
   g_ready = false;
   g_provisioned = false;
@@ -952,8 +1070,10 @@ VaultError begin(const char* password) {
   std::memset(g_hdr, 0, sizeof(g_hdr));
   crypto::wipe(g_key, sizeof(g_key));
   // Ранние отказы ниже (нет раздела, слишком короткий пароль) выходят до
-  // PasswordGuard, поэтому пароль прошлой попытки стёр именно здесь.
+  // PasswordGuard, поэтому материал прошлой попытки стёр именно здесь.
   crypto::wipe(g_password, sizeof(g_password));
+  g_passwordLen = 0;
+  g_keyFileFlag = false;
 
   g_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY,
                                     config::kFsVault);
@@ -975,14 +1095,23 @@ VaultError begin(const char* password) {
   publishSnapshot();
 
   if (!password || std::strlen(password) < config::kMinPassChars ||
-      std::strlen(password) >= sizeof(g_password)) {
+      std::strlen(password) >= config::kMaxPassChars) {
     return VaultError::WrongPassword;
   }
 
-  // Пароль запоминается: опрос слотов заголовков проверяет каждый своим ключом,
-  // а ключ выводится из соли в самом слоте. Строка, а не указатель, потому что
-  // вызывающая сторона вправе освободить свой буфер сразу после вызова.
-  std::memcpy(g_password, password, std::strlen(password) + 1);
+  // Материал KDF запоминается: опрос слотов заголовков проверяет каждый своим
+  // ключом, а ключ выводится из соли в самом слоте. Строка, а не указатель,
+  // потому что вызывающая сторона вправе освободить свой буфер сразу после
+  // вызова. Без ключевого файла это байт-в-байт строка пароля — так открывают
+  // хранилища, созданные до появления файловой поддержки.
+  const size_t matLen =
+      buildMaterial(g_password, sizeof(g_password), password, keyFile, keyFileLen);
+  if (matLen == 0) {
+    crypto::wipe(g_password, sizeof(g_password));
+    return VaultError::WrongPassword;
+  }
+  g_passwordLen = matLen;
+  g_keyFileFlag = (keyFile != nullptr && keyFileLen > 0);
   const PasswordGuard pwGuard;
 
   uint8_t raw[config::kVaultHeaderBytes];
@@ -998,23 +1127,15 @@ VaultError begin(const char* password) {
     // возвращает void и отказать не может.
     esp_fill_random(g_saltPw, sizeof(g_saltPw));
     esp_fill_random(g_saltDev, sizeof(g_saltDev));
-    // Считаем device-фактор сразу: если eFuse недоступен, хранилище заводить
-    // нельзя — ключ тогда не совпадёт при следующем открытии.
-    if (!device::factor(g_saltDev, sizeof(g_saltDev), g_key)) {
-      return VaultError::Crypto;
+    // Считаем ключ сразу: если eFuse недоступен, хранилище заводить нельзя —
+    // ключ тогда не совпадёт при следующем открытии. deriveKey берёт материал
+    // из g_password (пароль + при наличии — хэш файла) и соль device-фактора,
+    // которую мы только что сгенерировали.
+    const VaultError dk =
+        deriveKey(g_password, g_passwordLen, g_saltDev, config::kPbkdf2Iters);
+    if (dk != VaultError::Ok) {
+      return dk;
     }
-    uint8_t fromPw[crypto::kAesKeyLen] = {};
-    const int rc = crypto::pbkdf2HmacSha256(password, std::strlen(password), g_saltPw,
-                                            config::kPbkdf2SaltLen,
-                                            config::kPbkdf2Iters, fromPw);
-    if (rc != static_cast<int>(crypto::CipherError::Ok)) {
-      crypto::wipe(fromPw, sizeof(fromPw));
-      return VaultError::Crypto;
-    }
-    for (size_t i = 0; i < crypto::kAesKeyLen; ++i) {
-      g_key[i] ^= fromPw[i];
-    }
-    crypto::wipe(fromPw, sizeof(fromPw));
 
     g_generation = 1;
     g_iters = config::kPbkdf2Iters;
@@ -1054,7 +1175,8 @@ VaultError begin(const char* password) {
     const uint32_t seqA = stA == SlotState::kAbsent ? 0 : get32(cand[0] + kHdrSeq);
     const uint32_t seqB = stB == SlotState::kAbsent ? 0 : get32(cand[1] + kHdrSeq);
 
-    if (stA == SlotState::kInvalid || stB == SlotState::kInvalid) {
+    if (stA == SlotState::kInvalid || stB == SlotState::kInvalid ||
+        stA == SlotState::kTagMismatch || stB == SlotState::kTagMismatch) {
       // Порча одного слота не приговор: второй может быть цел. Отказываемся
       // только если испорченный слот новее второго — тогда откатиться значило бы
       // отдать не то состояние, которое записано последним.
@@ -1073,6 +1195,17 @@ VaultError begin(const char* password) {
         log::warn("vault: no valid header slot for password given");
         return VaultError::WrongPassword;
       }
+      // Структура новейшего слота цела, резерв данным паролем открывается, а
+      // новейший — нет: пароль относится к резервной копии (смена пароля), а не
+      // к текущему состоянию. И это отказ, а не откат: иначе старый пароль
+      // после rekey отдавал бы устаревшее хранилище.
+      const bool newerTagMismatch =
+          (stA == SlotState::kTagMismatch && (stB != SlotState::kValid || seqA > seqB)) ||
+          (stB == SlotState::kTagMismatch && (stA != SlotState::kValid || seqB > seqA));
+      if (newerTagMismatch) {
+        log::warn("vault: password matches the backup slot, not the current one");
+        return VaultError::WrongPassword;
+      }
     }
 
     const bool useA = stA == SlotState::kValid && (stB != SlotState::kValid || seqA > seqB);
@@ -1085,6 +1218,11 @@ VaultError begin(const char* password) {
 
   g_generation = get32(g_hdr + kHdrGeneration);
   g_iters = get32(g_hdr + kHdrIters);
+  // Источник истины о ключевом файле — флаг выбранного заголовка, а не входной
+  // параметр: он участвует в каждом последующем flushHeader. При успешном
+  // открытии параметр и флаг уже согласованы по построению (несогласованный
+  // материал даёт WrongPassword), поэтому здесь это не проверка, а запоминание.
+  g_keyFileFlag = (get32(g_hdr + kHdrFlags) & kFlagKeyfile) != 0;
   g_dataStart = get32(g_hdr + kHdrDataStart);
   g_usedEnd = get32(g_hdr + kHdrUsedBytes);
   // dataStart обязан быть ровно границей одной из двух областей. Проверка «в
@@ -1101,7 +1239,7 @@ VaultError begin(const char* password) {
   std::memcpy(g_saltPw, g_hdr + kHdrSaltPw, sizeof(g_saltPw));
   std::memcpy(g_saltDev, g_hdr + kHdrSaltDev, sizeof(g_saltDev));
 
-  const VaultError dk = deriveKey(password, g_saltDev, g_iters);
+  const VaultError dk = deriveKey(g_password, g_passwordLen, g_saltDev, g_iters);
   if (dk != VaultError::Ok) {
     crypto::wipe(g_key, sizeof(g_key));
     return dk;
@@ -1535,15 +1673,29 @@ VaultError remove(uint32_t id) {
 // перебором нельзя. Пароль обязателен: без него новый KEK не вывести, а
 // оставлять после стирания заголовок со старым ключом означало бы завести
 // хранилище, которое нельзя открыть.
-VaultError clear(const char* password) {
+VaultError clear(const char* password, const uint8_t* keyFile,
+                 size_t keyFileLen) {
   const Guard guard;
   if (!g_ready) {
     return VaultError::BootStrap;
   }
-  if (!password || std::strlen(password) < config::kMinPassChars) {
+  if (!password || std::strlen(password) < config::kMinPassChars ||
+      std::strlen(password) >= config::kMaxPassChars) {
     return VaultError::WrongPassword;
   }
+  // Материал собирается ДО стирания раздела: при отказе (слишком длинный пароль,
+  // сбой SHA-256) флеш остаётся нетронутым.
+  const size_t matLen =
+      buildMaterial(g_password, sizeof(g_password), password, keyFile, keyFileLen);
+  if (matLen == 0) {
+    crypto::wipe(g_password, sizeof(g_password));
+    return VaultError::WrongPassword;
+  }
+  g_passwordLen = matLen;
+  g_keyFileFlag = (keyFile != nullptr && keyFileLen > 0);
   if (esp_partition_erase_range(g_part, 0, g_part->size) != ESP_OK) {
+    crypto::wipe(g_password, sizeof(g_password));
+    g_passwordLen = 0;
     return VaultError::Io;
   }
   std::memset(g_key, 0, sizeof(g_key));
@@ -1562,7 +1714,11 @@ VaultError clear(const char* password) {
   g_usedEnd = g_dataStart;
   esp_fill_random(g_saltPw, sizeof(g_saltPw));
   esp_fill_random(g_saltDev, sizeof(g_saltDev));
-  const VaultError dk = deriveKey(password, g_saltDev, g_iters);
+  const VaultError dk = deriveKey(g_password, g_passwordLen, g_saltDev, g_iters);
+  // Материал нужен ровно до вывода ключа; дальше его обязаны стирать все пути,
+  // как это делает PasswordGuard в begin().
+  crypto::wipe(g_password, sizeof(g_password));
+  g_passwordLen = 0;
   if (dk != VaultError::Ok) {
     return dk;
   }
@@ -1570,6 +1726,226 @@ VaultError clear(const char* password) {
     return VaultError::Io;
   }
   log::info("vault: cleared");
+  publishSnapshot();
+  return VaultError::Ok;
+}
+
+// Смена мастер-пароля открытого хранилища. Требует g_ready: без открытой
+// сессии расшифровать существующие записи нечем, а без проверки открытой
+// сессии операция была бы стиранием хранилища по одному лишь знанию HTTP-пути.
+//
+// Устройство операции повторяет компакцию: снимок состояния, новые соли и
+// ключ, запись живых записей в неактивную область, переключение заголовком,
+// и только потом уничтожение старой области. До flushHeader() отказ откатывается
+// в RAM, и старый пароль действует — точка невозврата ровно одна, как и в
+// compact().
+VaultError rekey(const char* newPassword, const uint8_t* keyFile,
+                 size_t keyFileLen) {
+  const Guard guard;
+  if (!g_ready) {
+    return VaultError::BootStrap;
+  }
+  if (!newPassword || std::strlen(newPassword) < config::kMinPassChars ||
+      std::strlen(newPassword) >= config::kMaxPassChars) {
+    return VaultError::WrongPassword;
+  }
+
+  // Новый материал собирается в g_password: после begin() этот буфер свободен
+  // (PasswordGuard стер его сразу после открытия), и чистить его вручную
+  // не требуется — все пути ниже стирают его сами.
+  const size_t matLen = buildMaterial(g_password, sizeof(g_password), newPassword,
+                                      keyFile, keyFileLen);
+  if (matLen == 0) {
+    crypto::wipe(g_password, sizeof(g_password));
+    return VaultError::WrongPassword;
+  }
+  g_passwordLen = matLen;
+  const bool newKeyFileFlag = (keyFile != nullptr && keyFileLen > 0);
+
+  const size_t oldDataStart = g_dataStart;
+  const size_t oldUsedEnd = g_usedEnd;
+  const int oldRegion = g_region;
+  const int targetRegion = 1 - oldRegion;
+  const size_t targetStart = regionStart(targetRegion);
+
+  // Снимки, без которых отказ ниже не откатить: заголовок, обе соли, старый
+  // ключ (для расшифровки старых записей — g_key перезапишется новым),
+  // флаг ключевого файла и nextId.
+  uint8_t oldHdr[config::kVaultHeaderBytes];
+  std::memcpy(oldHdr, g_hdr, sizeof(oldHdr));
+  uint8_t oldAad[config::kVaultHeaderBytes];
+  buildAad(g_hdr, oldAad);
+  uint8_t oldSaltPw[config::kPbkdf2SaltLen];
+  uint8_t oldSaltDev[config::kPbkdf2SaltLen];
+  std::memcpy(oldSaltPw, g_saltPw, sizeof(oldSaltPw));
+  std::memcpy(oldSaltDev, g_saltDev, sizeof(oldSaltDev));
+  uint8_t oldKey[crypto::kAesKeyLen];
+  std::memcpy(oldKey, g_key, sizeof(oldKey));
+  const bool oldKeyFileFlag = g_keyFileFlag;
+  const uint32_t oldNextId = g_nextId;
+
+  // Снимок индекса в g_scratch: g_index перезаполняется по мере записи, а
+  // читать старые смещения при этом всё ещё требуется.
+  Index* const saved = g_scratch;
+  const uint32_t savedCount = g_live;
+  const size_t savedPayload = g_livePayload;
+  for (uint32_t i = 0; i < g_live; ++i) {
+    saved[i] = g_index[i];
+  }
+
+  // Место под сборку считаем заранее и отказываем до любых изменений. Та же
+  // сумма, что и при компакции: записи не меняют размер от смены ключа.
+  size_t needBytes = 0;
+  for (uint32_t i = 0; i < savedCount; ++i) {
+    needBytes += kRecFixed + saved[i].len;
+  }
+  if (targetStart + needBytes > regionStart(2)) {
+    crypto::wipe(g_password, sizeof(g_password));
+    g_passwordLen = 0;
+    return VaultError::NoSpace;
+  }
+
+  // Откат RAM на любой отказ до flushHeader: старые соли и старый ключ
+  // восстанавливаются, и старый пароль открывает хранилище как прежде.
+  // genBumped=false — для отказов, случившихся до g_generation += 1.
+  auto rollback = [&](bool genBumped) {
+    std::memcpy(g_saltPw, oldSaltPw, sizeof(oldSaltPw));
+    std::memcpy(g_saltDev, oldSaltDev, sizeof(oldSaltDev));
+    std::memcpy(g_key, oldKey, sizeof(oldKey));
+    if (genBumped) {
+      g_generation -= 1;
+    }
+    g_keyFileFlag = oldKeyFileFlag;
+    g_region = oldRegion;
+    g_dataStart = oldDataStart;
+    g_usedEnd = oldUsedEnd;
+    g_compactedOnce = (get32(oldHdr + kHdrFlags) & kFlagCompacted) != 0;
+    std::memcpy(g_hdr, oldHdr, sizeof(oldHdr));
+    g_live = savedCount;
+    g_livePayload = savedPayload;
+    for (uint32_t i = 0; i < savedCount; ++i) {
+      g_index[i] = saved[i];
+    }
+    g_nextId = oldNextId;
+    crypto::wipe(g_password, sizeof(g_password));
+    g_passwordLen = 0;
+    // Старый ключ больше не нужен: g_key уже восстановлен из копии.
+    crypto::wipe(oldKey, sizeof(oldKey));
+  };
+
+  // Новые соли и новый ключ. Пока не перезаписан заголовок, на флеше ничего
+  // не изменилось: любой отказ здесь откатывается без ущерба.
+  esp_fill_random(g_saltPw, sizeof(g_saltPw));
+  esp_fill_random(g_saltDev, sizeof(g_saltDev));
+  const VaultError dk =
+      deriveKey(g_password, g_passwordLen, g_saltDev, g_iters);
+  if (dk != VaultError::Ok) {
+    rollback(false);
+    return dk;
+  }
+  g_keyFileFlag = newKeyFileFlag;
+  crypto::wipe(g_password, sizeof(g_password));
+  g_passwordLen = 0;
+
+  // Стираем неактивную область: живого в ней нет, а под старым ключом
+  // остатки прошлых компакций уже невалидны.
+  if (esp_partition_erase_range(g_part, targetStart, config::kVaultRegionBytes) !=
+      ESP_OK) {
+    rollback(false);
+    return VaultError::Io;
+  }
+
+  // Переключение до записи: writeRecordAt строит AAD из g_hdr, и если тот
+  // останется со старым dataStart/поколением, теги новых записей не сойдутся
+  // после перезагрузки. Поколение растёт — nonceFor включает его, поэтому
+  // (generation, offset) новой записи не повторяет старый даже при совпадении
+  // смещений, а здесь они ещё и в разных областях.
+  g_generation += 1;
+  g_region = targetRegion;
+  g_dataStart = targetStart;
+  g_usedEnd = targetStart;
+  buildHdr();
+
+  uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc(config::kMaxEntryLen,
+                                                        MALLOC_CAP_SPIRAM));
+  uint8_t* pt = static_cast<uint8_t*>(heap_caps_malloc(config::kMaxEntryLen,
+                                                       MALLOC_CAP_SPIRAM));
+  if (!buf || !pt) {
+    heap_caps_free(buf);
+    heap_caps_free(pt);
+    rollback(true);
+    return VaultError::NoSpace;
+  }
+
+  size_t cursor = targetStart;
+  g_live = 0;
+  g_livePayload = 0;
+  bool ok = true;
+  for (uint32_t i = 0; i < savedCount && ok; ++i) {
+    uint8_t head[kRecFixed];
+    if (!readRange(saved[i].offset, head, kRecFixed)) {
+      ok = false;
+      break;
+    }
+    if (!readRange(saved[i].offset + kRecFixed, buf, saved[i].len)) {
+      ok = false;
+      break;
+    }
+    // Старые записи: СТАРЫЙ ключ и СТАРЫЙ AAD — снимок сделан до каких-либо
+    // изменений. Новые пишутся writeRecordAt уже под новым g_key и новым AAD.
+    size_t ptLen = 0;
+    const int dec = crypto::aesGcmDecrypt(oldKey, head + 6, oldAad, sizeof(oldAad),
+                                          buf, saved[i].len,
+                                          head + 6 + crypto::kGcmIvLen, pt, &ptLen);
+    if (dec != static_cast<int>(crypto::CipherError::Ok) ||
+        ptLen != saved[i].len) {
+      ok = false;
+      break;
+    }
+    if (writeRecordAt(cursor, saved[i].id, pt, saved[i].len) != VaultError::Ok) {
+      ok = false;
+      break;
+    }
+    g_index[g_live].id = saved[i].id;
+    g_index[g_live].offset = cursor;
+    g_index[g_live].len = saved[i].len;
+    ++g_live;
+    g_livePayload += saved[i].len;
+    cursor += kRecFixed + saved[i].len;
+  }
+  crypto::wipe(buf, config::kMaxEntryLen);
+  crypto::wipe(pt, config::kMaxEntryLen);
+  heap_caps_free(buf);
+  heap_caps_free(pt);
+
+  if (!ok) {
+    rollback(true);
+    return VaultError::Io;
+  }
+
+  // Точка невозврата: заголовок с новым ключом дописан. С этого момента
+  // старый пароль не открывает хранилище, новый — открывает.
+  g_usedEnd = cursor;
+  buildHdr();
+  if (!flushHeader()) {
+    rollback(true);
+    return VaultError::Io;
+  }
+
+  // Старая область уходит сразу: там записи под старым ключом, которые новое
+  // хранилище уже не читает. Best-effort — при обрыве стирания мусор доживёт
+  // до следующей компакции, которая сотрёт неактивную область целиком.
+  if (esp_partition_erase_range(g_part, regionStart(oldRegion),
+                                config::kVaultRegionBytes) != ESP_OK) {
+    log::warn("vault: rekey, old region erase failed (will be swept later)");
+  }
+
+  crypto::wipe(oldKey, sizeof(oldKey));
+  crypto::wipe(oldSaltPw, sizeof(oldSaltPw));
+  crypto::wipe(oldSaltDev, sizeof(oldSaltDev));
+  log::info("vault: rekeyed -> gen %u, region %d, %u entries",
+            static_cast<unsigned>(g_generation), g_region,
+            static_cast<unsigned>(g_live));
   publishSnapshot();
   return VaultError::Ok;
 }
@@ -1593,6 +1969,8 @@ VaultError reset() {
   }
   crypto::wipe(g_key, sizeof(g_key));
   crypto::wipe(g_password, sizeof(g_password));
+  g_passwordLen = 0;
+  g_keyFileFlag = false;
   crypto::wipe(g_hdr, sizeof(g_hdr));
   crypto::wipe(g_saltPw, sizeof(g_saltPw));
   crypto::wipe(g_saltDev, sizeof(g_saltDev));

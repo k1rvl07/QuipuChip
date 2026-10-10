@@ -169,6 +169,37 @@ int hmacSha256(const void* key, size_t keyLen, const void* data, size_t dataLen,
   return static_cast<int>(CipherError::Ok);
 }
 
+int sha256(const void* data, size_t len, uint8_t out[32]) {
+  if (!data || !out) {
+    return static_cast<int>(CipherError::InvalidArg);
+  }
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!md) {
+    return static_cast<int>(CipherError::EncryptFail);
+  }
+  if (mbedtls_md(md, reinterpret_cast<const unsigned char*>(data), len, out) != 0) {
+    return static_cast<int>(CipherError::EncryptFail);
+  }
+  return static_cast<int>(CipherError::Ok);
+}
+
+int hmacSha1(const void* key, size_t keyLen, const void* data, size_t dataLen,
+             uint8_t macOut[20]) {
+  if (!key || !data || !macOut) {
+    return static_cast<int>(CipherError::InvalidArg);
+  }
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
+  if (!md) {
+    return static_cast<int>(CipherError::EncryptFail);
+  }
+  if (mbedtls_md_hmac(md, reinterpret_cast<const unsigned char*>(key), keyLen,
+                      reinterpret_cast<const unsigned char*>(data), dataLen,
+                      macOut) != 0) {
+    return static_cast<int>(CipherError::EncryptFail);
+  }
+  return static_cast<int>(CipherError::Ok);
+}
+
 int aesGcmEncrypt(const void* key, const void* iv, const void* aad, size_t aadLen,
                   const void* plaintext, size_t ptLen, void* ciphertextOut,
                   size_t* ctLenOut, void* tagOut) {

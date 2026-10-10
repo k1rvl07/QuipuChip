@@ -56,5 +56,10 @@ int lastError();
 // нельзя отличить «bridge up 192.168.7.1» от «bridge up, адреса нет».
 bool ip(uint8_t out[4]);
 
+// Глубина очереди кадров lwIP → USB. 0xFFFFFFFF, если очередь не создана.
+// Нужно heartbeat'у различать «lwIP ничего не отдаёт» (q=0) от «кадры стоят в
+// очереди, но pump() не может их забрать» (q>0 при замёрзшем tx).
+uint32_t txQueueWaiting();
+
 }  // namespace net_bridge
 }  // namespace pm

@@ -27,6 +27,7 @@
 // wordlist.h включается здесь ради сверки формата пароля (gateA2-words-in-dict).
 // Таблица определена один раз в src/wordlist.cpp, поэтому второе включение
 // заголовка копий не создаёт.
+#include "totp.h"
 #include "vault.h"
 #include "wordlist.h"
 
@@ -112,12 +113,15 @@ void fillEntry(Entry& e, uint32_t id, const char* tag) {
   std::snprintf(e.password, sizeof(e.password), "pw-%s", tag);
   std::snprintf(e.url, sizeof(e.url), "https://example.invalid/%s", tag);
   std::snprintf(e.note, sizeof(e.note), "note-%s", tag);
+  std::snprintf(e.tags, sizeof(e.tags), "tag-%s,shared", tag);
+  std::snprintf(e.totp, sizeof(e.totp), "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
 }
 
 bool entriesEqual(const Entry& a, const Entry& b) {
   return a.id == b.id && std::strcmp(a.title, b.title) == 0 &&
          std::strcmp(a.login, b.login) == 0 && std::strcmp(a.password, b.password) == 0 &&
-         std::strcmp(a.url, b.url) == 0 && std::strcmp(a.note, b.note) == 0;
+         std::strcmp(a.url, b.url) == 0 && std::strcmp(a.note, b.note) == 0 &&
+         std::strcmp(a.tags, b.tags) == 0 && std::strcmp(a.totp, b.totp) == 0;
 }
 
 const esp_partition_t* vaultPartition() {
@@ -289,6 +293,22 @@ bool tamperByteIsRejected(const esp_partition_t* part, size_t off) {
   return tamperBytesRejected(part, off, &bad, 1);
 }
 
+// Ожидание завершения job'а с периодом 200 мс. false — job не принят (0) или
+// результат не пришёл за timeoutMs. Вынесено в helper: тут же стояли бы пять
+// одинаковых копий цикла poll, и каждая копия — место для опечатки в таймауте.
+bool waitJob(auth::JobId job, auth::JobView* v, uint32_t timeoutMs) {
+  if (job == auth::kNoJob || v == nullptr) {
+    return false;
+  }
+  for (uint32_t waited = 0; waited < timeoutMs; waited += 200) {
+    if (auth::poll(job, v) && v->result != auth::Result::Pending) {
+      return true;
+    }
+    delay(200);
+  }
+  return false;
+}
+
 }  // namespace
 
 void cryptoGates() {
@@ -403,6 +423,44 @@ void cryptoGates() {
     crypto::wipe(f2, sizeof(f2));
     crypto::wipe(f3, sizeof(f3));
     report("device-factor", ok, "stable, salt-dependent");
+  }
+
+  // TOTP по эталонным векторам RFC 6238 (SHA-1). Секрет — ASCII
+  // "12345678901234567890", его base32-запись и есть векторный секрет. Вектор
+  // на T = 20000000000 не проверяется: он не помещается в uint32_t, а время на
+  // устройстве приходит 32-битным.
+  {
+    const char* kSecret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    struct TotKat {
+      uint32_t t;
+      const char* expect;
+    };
+    const TotKat vectors[] = {
+        {59u, "287082"},
+        {1111111109u, "081804"},
+        {1111111111u, "050471"},
+        {1234567890u, "005924"},
+        {2000000000u, "279037"},
+    };
+    uint32_t okCount = 0;
+    char code[7];
+    for (const TotKat& v : vectors) {
+      if (totp::code(kSecret, v.t, code) && std::strcmp(code, v.expect) == 0) {
+        ++okCount;
+      }
+    }
+    // Отбраковка мусора: короткий секрет, запрещённый символ, пустая строка.
+    const bool rejects = !totp::validSecret("abc") &&
+                         !totp::validSecret("ABCDEFGH1IJKLMNOP") &&  // '1' вне base32
+                         !totp::validSecret("") &&
+                         !totp::code("too-short", 59u, code);
+    char detail[64];
+    std::snprintf(detail, sizeof(detail), "%u/%u vectors, invalid rejected: %d",
+                  static_cast<unsigned>(okCount),
+                  static_cast<unsigned>(sizeof(vectors) / sizeof(vectors[0])),
+                  static_cast<int>(rejects));
+    report("crypto-totp-rfc6238", okCount == 5 && rejects, detail);
+    crypto::wipe(code, sizeof(code));
   }
 }
 
@@ -839,19 +897,29 @@ void vaultGates() {
   {
     const esp_partition_t* part = vaultPartition();
     bool ok = false;
-    if (vault::begin(kGatePassword) == VaultError::Ok && part) {
+    uint32_t dataStart = 0;
+    VaultError openRc = VaultError::NotFound;
+    char detail[80] = "no detail";
+    if ((openRc = vault::begin(kGatePassword)) == VaultError::Ok && part) {
       uint8_t hdr[config::kVaultHeaderBytes];
       if (readActiveHeader(hdr)) {
-        const size_t dataStart = readU32(hdr + kHdrDataStart);
-        // Смещение должно попадать внутрь активной области, иначе проверка
-        // била бы по чужому слоту заголовка и ничего не проверяла.
-        if (dataStart >= config::kVaultRegion0Offset &&
-            dataStart < config::kVaultRegion0Offset + config::kVaultRegionBytes) {
+        dataStart = readU32(hdr + kHdrDataStart);
+        // Ровно граница одной из двух областей — тот же критерий, что в begin().
+        // Прежняя проверка покрывала только область 0; после компакции в gate7
+        // dataStart указывает на область 1, гейт не портил ничего и падал сам:
+        // «защита шифротекста» при этом не проверялась вовсе.
+        if (dataStart == config::kVaultRegion0Offset ||
+            dataStart == config::kVaultRegion0Offset + config::kVaultRegionBytes) {
           ok = tamperByteIsRejected(part, dataStart + kRecFixed);
         }
       }
+      std::snprintf(detail, sizeof(detail), "open %d dataStart %u rejected %d",
+                    static_cast<int>(openRc), static_cast<unsigned>(dataStart),
+                    ok ? 1 : 0);
+    } else {
+      std::snprintf(detail, sizeof(detail), "open %d", static_cast<int>(openRc));
     }
-    report("gate8-tamper-ct", ok, "ciphertext flip rejected");
+    report("gate8-tamper-ct", ok, detail);
   }
 
   // Порча поля счётчиков в заголовке. Счётчики не входят в AAD, поэтому
@@ -874,22 +942,33 @@ void vaultGates() {
     report("gate9-tamper-count", ok, "entryCount mismatch rejected");
   }
 
-  // Порча тега записи: последние 16 байт первой записи. Это не файл и не
-  // AAD, но подмена обязана ломать расшифровку так же, как и подмена текста.
+  // Порча тега GCM первой записи: тег лежит в фиксированной части (head+18),
+  // его последний байт — dataStart + kRecFixed - 1. Это не файл и не AAD, но
+  // подмена обязана ломать расшифровку так же, как и подмена текста.
   {
     const esp_partition_t* part = vaultPartition();
     bool ok = false;
-    if (vault::begin(kGatePassword) == VaultError::Ok && part) {
+    uint32_t dataStart = 0;
+    VaultError openRc = VaultError::NotFound;
+    char detail[80] = "no detail";
+    if ((openRc = vault::begin(kGatePassword)) == VaultError::Ok && part) {
       uint8_t hdr[config::kVaultHeaderBytes];
       if (readActiveHeader(hdr)) {
-        const size_t dataStart = readU32(hdr + kHdrDataStart);
-        if (dataStart >= config::kVaultRegion0Offset &&
-            dataStart < config::kVaultRegion0Offset + config::kVaultRegionBytes) {
+        dataStart = readU32(hdr + kHdrDataStart);
+        // Как в gate8: только точная граница одной из двух областей, иначе
+        // после компакции гейт смотрел бы мимо и ничего не портил.
+        if (dataStart == config::kVaultRegion0Offset ||
+            dataStart == config::kVaultRegion0Offset + config::kVaultRegionBytes) {
           ok = tamperByteIsRejected(part, dataStart + kRecFixed - 1);
         }
       }
+      std::snprintf(detail, sizeof(detail), "open %d dataStart %u rejected %d",
+                    static_cast<int>(openRc), static_cast<unsigned>(dataStart),
+                    ok ? 1 : 0);
+    } else {
+      std::snprintf(detail, sizeof(detail), "open %d", static_cast<int>(openRc));
     }
-    report("gate10-tamper-tag", ok, "record tag flip rejected");
+    report("gate10-tamper-tag", ok, detail);
   }
 
   // Поверхность сессии: close(), get(), provisioned(), snapshot(), reset().
@@ -1346,10 +1425,245 @@ void authGates() {
   }
 }
 
-// Гейт reset-job. Отдельной функцией и ПОСЛЕ vaultGates(), потому что reset
-// уничтожает хранилище, а vaultGates() на каждом шаге опирается на то, что оно
-// есть и открыто под kGatePassword. Внутри authGates() reset отработал бы до
-// конца прогона и унёс бы всё, что дальше проверяется.
+// Гейты ключевого файла: материал KDF = пароль ‖ SHA-256(файла), флаг
+// kFlagKeyfile в заголовке. Идут ПОСЛЕ vaultGates(): тот заканчивает
+// vault::clear(kGatePassword) без файла, то есть вход — provisioned без флага,
+// открыто под kGatePassword. Собственного стирания здесь нет: единственное
+// стирание за прогон уже случилось в run(), а resetGates() в конце унесёт то,
+// что оставят эти гейты.
+//
+// Обязанность выхода: provisioned под kGatePassword БЕЗ ключевого файла, иначе
+// resetGates() не сможет открыть хранилище своим submitUnlock(kGatePassword).
+void keyfileGates() {
+  log::info("=== keyfile gates ===");
+
+  // Не секреты, а фиксированные тестовые материалы: два разных файла обязаны
+  // давать разные ключи. Файл Б — обратный байтам файла А, то есть отличается
+  // каждый байт, а не один.
+  const uint8_t fileA[32] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                             0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+                             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                             0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+  const uint8_t fileB[32] = {0x1f, 0x1e, 0x1d, 0x1c, 0x1b, 0x1a, 0x19, 0x18,
+                             0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
+                             0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08,
+                             0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00};
+  const size_t fileLen = sizeof(fileA);
+
+  // K1: перевод существующего хранилища на файл — clear с файлом, и после него
+  // флаг обязан читаться без пароля. Проверяется и то, что записи под файловым
+  // ключом пишутся: следующие гейты читают её же.
+  uint32_t probeId = 0;
+  {
+    const VaultError rc = vault::clear(kGatePassword, fileA, fileLen);
+    const bool flag = vault::keyFileRequired();
+    Entry e = {};
+    fillEntry(e, 0, "keyfile");
+    const VaultError addRc = rc == VaultError::Ok ? vault::add(e, &probeId) : rc;
+    crypto::wipe(&e, sizeof(e));
+    char detail[72];
+    std::snprintf(detail, sizeof(detail), "clear %d, flag %d, entry %d",
+                  static_cast<int>(rc), static_cast<int>(flag),
+                  static_cast<int>(addRc));
+    report("gateK1-keyfile-provision",
+           rc == VaultError::Ok && flag && addRc == VaultError::Ok && probeId != 0,
+           detail);
+    if (rc != VaultError::Ok) {
+      return;
+    }
+  }
+
+  // K2: unlock через auth-конвейер, а не прямым begin() — на этом пути ключевой
+  // файл копируется в очередь и в Request воркера, и обрыв этой цепочки (файл,
+  // дошедший не целиком, или склейка материалов не в ту сторону) даёт неверный
+  // ключ именно здесь. Запись обязана читаться после такого открытия.
+  {
+    auth::lock();
+    const auth::JobId job = auth::submitUnlock(kGatePassword, fileA, fileLen);
+    auth::JobView v = {};
+    const bool polled = waitJob(job, &v, 40000);
+    const auth::Result res = v.result;
+    crypto::wipe(v.password, sizeof(v.password));
+    crypto::wipe(v.sessionToken, sizeof(v.sessionToken));
+    bool getOk = false;
+    if (polled && res == auth::Result::Ok) {
+      Entry got = {};
+      getOk = vault::get(probeId, &got) == VaultError::Ok &&
+              std::strcmp(got.title, "gate-keyfile") == 0;
+      crypto::wipe(&got, sizeof(got));
+    }
+    char detail[72];
+    std::snprintf(detail, sizeof(detail), "unlock %s, entry %s",
+                  polled ? auth::toString(res) : "not polled", getOk ? "ok" : "lost");
+    report("gateK2-keyfile-unlock",
+           polled && res == auth::Result::Ok && getOk && auth::state().unlocked,
+           detail);
+  }
+
+  // K3: тот же пароль БЕЗ файла обязан дать WrongPassword, а не открыть:
+  // материал отличается на SHA-256 файла, и расхождение обязано дойти до
+  // проверки тега. Это и есть проверка, что файл реально участвует в KDF, а не
+  // просто запоминается в заголовке.
+  auth::lock();
+  {
+    const auth::JobId job = auth::submitUnlock(kGatePassword);
+    auth::JobView v = {};
+    const bool polled = waitJob(job, &v, 40000);
+    const auth::Result res = v.result;
+    crypto::wipe(v.password, sizeof(v.password));
+    crypto::wipe(v.sessionToken, sizeof(v.sessionToken));
+    report("gateK3-keyfile-no-file",
+           polled && res == auth::Result::WrongPassword && !auth::state().unlocked,
+           polled ? auth::toString(res) : "not polled");
+  }
+
+  // K4: чужой файл даёт такой же WrongPassword — ключ обязан зависеть от
+  // СОДЕРЖИМОГО файла, а не от самого факта наличия файла. После двух
+  // неудач failCount растёт, и clearLockout() нужен, чтобы остаток не повис на
+  // последующих гейтах.
+  {
+    const auth::JobId job = auth::submitUnlock(kGatePassword, fileB, fileLen);
+    auth::JobView v = {};
+    const bool polled = waitJob(job, &v, 40000);
+    const auth::Result res = v.result;
+    crypto::wipe(v.password, sizeof(v.password));
+    crypto::wipe(v.sessionToken, sizeof(v.sessionToken));
+    auth::clearLockout();
+    report("gateK4-keyfile-wrong-file",
+           polled && res == auth::Result::WrongPassword && !auth::state().unlocked,
+           polled ? auth::toString(res) : "not polled");
+  }
+
+  // K5: возврат к хранилищу без файла — clear с верным паролем и файлом, но уже
+  // БЕЗ флага, обязателен для resetGates(). Одновременно проверяется, что флаг
+  // висит именно на provisioned-заголовке, а не где-то в RAM.
+  {
+    vault::close();
+    const VaultError openRc = vault::begin(kGatePassword, fileA, fileLen);
+    const VaultError clearRc =
+        openRc == VaultError::Ok ? vault::clear(kGatePassword) : openRc;
+    const bool flagGone = !vault::keyFileRequired();
+    const bool prov = vault::provisioned();
+    vault::close();
+    char detail[72];
+    std::snprintf(detail, sizeof(detail), "open %d, clear %d, flag %d, prov %d",
+                  static_cast<int>(openRc), static_cast<int>(clearRc),
+                  static_cast<int>(flagGone), static_cast<int>(prov));
+    report("gateK5-keyfile-restore",
+           openRc == VaultError::Ok && clearRc == VaultError::Ok && flagGone && prov,
+           detail);
+  }
+}
+
+// Гейты смены мастер-пароля. Вход обязателен: provisioned под kGatePassword без
+// ключевого файла (оставляет keyfileGates()), хранилище закрыто — потому что
+// первый гейт и проверяет отказ rekey на закрытом хранилище. Выход тот же, что
+// у keyfileGates(), плюс пароль снова kGatePassword — resetGates() открывает им.
+void rekeyGates() {
+  log::info("=== rekey gates ===");
+
+  const char kNewPassword[] = "gate-rekey-passphrase-9b-not-a-real-secret";
+
+  // R1: rekey на закрытом хранилище обязан дать Refused, а не Error или тем
+  // более Ok: без расшифрованных записей сменить ключ невозможно, и UI должен
+  // показать «не сейчас», а не «сбой».
+  vault::close();
+  {
+    const auth::JobId job = auth::submitRekey(kGatePassword, kNewPassword);
+    auth::JobView v = {};
+    const bool polled = waitJob(job, &v, 20000);
+    const auth::Result res = v.result;
+    const auth::Job kind = v.kind;
+    crypto::wipe(v.password, sizeof(v.password));
+    crypto::wipe(v.sessionToken, sizeof(v.sessionToken));
+    report("gateR1-rekey-refused-closed",
+           polled && res == auth::Result::Refused && kind == auth::Job::Rekey,
+           polled ? auth::toString(res) : "not polled");
+  }
+
+  // R2: смена через auth-конвейер на живой сессии. Сессия обязана пережить
+  // rekey — токен выдаётся не под пароль, иначе клиент после смены пароля
+  // отваливался бы и не мог бы узнать об успехе.
+  {
+    const auth::JobId ujob = auth::submitUnlock(kGatePassword);
+    auth::JobView uv = {};
+    const bool unlocked =
+        waitJob(ujob, &uv, 40000) && uv.result == auth::Result::Ok;
+    const auth::Result ures = uv.result;
+    crypto::wipe(uv.password, sizeof(uv.password));
+    crypto::wipe(uv.sessionToken, sizeof(uv.sessionToken));
+
+    // Запись добавляется ПЕРЕД сменой: rekey обязан перезаписать каждую живую
+    // запись под новым ключом, и проверяется именно она, а не пустое
+    // хранилище.
+    uint32_t probeId = 0;
+    Entry e = {};
+    fillEntry(e, 0, "rekey");
+    const VaultError addRc = unlocked ? vault::add(e, &probeId) : VaultError::BootStrap;
+    crypto::wipe(&e, sizeof(e));
+
+    const auth::JobId job = auth::submitRekey(kGatePassword, kNewPassword);
+    auth::JobView v = {};
+    const bool polled = waitJob(job, &v, 60000);
+    const auth::Result res = v.result;
+    crypto::wipe(v.password, sizeof(v.password));
+    crypto::wipe(v.sessionToken, sizeof(v.sessionToken));
+    char tok[auth::kSessionTokenHexLen + 1] = {};
+    const bool sessionAlive = auth::state().unlocked && auth::sessionTokenHex(tok, sizeof(tok));
+    char detail[80];
+    std::snprintf(detail, sizeof(detail), "unlock %s, add %d, rekey %s, session %d",
+                  polled && unlocked ? auth::toString(ures) : "fail",
+                  static_cast<int>(addRc),
+                  polled ? auth::toString(res) : "not polled", sessionAlive ? 1 : 0);
+    report("gateR2-rekey-ok", unlocked && addRc == VaultError::Ok && polled &&
+                                  res == auth::Result::Ok && sessionAlive &&
+                                  probeId != 0,
+           detail);
+
+    // R3 + R4: старый пароль не открывает, новый открывает, и запись
+    // переживает смену ключа на флеше.
+    vault::close();
+    const VaultError oldRc = vault::begin(kGatePassword);
+    vault::close();
+    const VaultError newRc = vault::begin(kNewPassword);
+    Entry got = {};
+    const VaultError getRc = newRc == VaultError::Ok ? vault::get(probeId, &got)
+                                                     : newRc;
+    const bool dataOk = getRc == VaultError::Ok &&
+                        std::strcmp(got.title, "gate-rekey") == 0 &&
+                        std::strcmp(got.tags, "tag-rekey,shared") == 0;
+    crypto::wipe(&got, sizeof(got));
+    char detail34[80];
+    std::snprintf(detail34, sizeof(detail34), "old %d new %d entry %d",
+                  static_cast<int>(oldRc), static_cast<int>(newRc),
+                  static_cast<int>(dataOk));
+    report("gateR3-rekey-old-pw-rejected", oldRc == VaultError::WrongPassword,
+           detail34);
+    report("gateR4-rekey-data-survives", newRc == VaultError::Ok && dataOk, detail34);
+
+    // R5: возврат на kGatePassword напрямую через vault::rekey — путь, которым
+    // пользуются все последующие гейты. Без него resetGates() не открыл бы
+    // хранилище.
+    const VaultError backRc = newRc == VaultError::Ok
+                                  ? vault::rekey(kGatePassword)
+                                  : VaultError::BootStrap;
+    const bool flag = vault::keyFileRequired();
+    const bool prov = vault::provisioned();
+    vault::close();
+    char detail5[72];
+    std::snprintf(detail5, sizeof(detail5), "back %d, flag %d, prov %d",
+                  static_cast<int>(backRc), static_cast<int>(flag),
+                  static_cast<int>(prov));
+    report("gateR5-rekey-restore",
+           backRc == VaultError::Ok && !flag && prov, detail5);
+  }
+}
+
+// Гейт reset-job. Отдельной функцией и ПОСЛЕДНИМ среди разрушительных,
+// потому что reset уничтожает хранилище, а все предыдущие гейты на каждом
+// шаге опираются на то, что оно есть и открыто под kGatePassword. Внутри
+// authGates() reset отработал бы до конца прогона и унёс бы всё, что дальше
+// проверяется.
 //
 // Разрушителен по определению: раздел к этому моменту уже стёрт, а в нём лежат
 // только записи гейтов.
@@ -1491,6 +1805,14 @@ void run(bool wipeVault) {
   // стирание за прогон — выше, и оно уже случилось (или не потребовалось).
   authGates();
   vaultGates();
+  // Ключевой файл и смена пароля стоят МЕЖДУ vault- и reset-гейтами: оба
+  // требуют provisioned-хранилища (vaultGates() оставляет его через clear) и
+  // обязаны вернуть провижин без ключевого файла и под kGatePassword —
+  // иначе resetGates() не откроет хранилище своим submitUnlock(kGatePassword)
+  // и H1 упадёт не по своей причине. Как и authGates(), эти два не стират
+  // раздел: единственное стирание за прогон — выше.
+  keyfileGates();
+  rekeyGates();
   // reset-job идёт последним и стирает хранилище, на которое опираются все
   // предыдущие гейты. После него раздел остаётся пустым — это и есть чистое
   // состояние после прогона.

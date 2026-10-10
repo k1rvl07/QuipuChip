@@ -37,6 +37,7 @@
 #include "soc/dport_reg.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/usb_periph.h"
+#include "soc/usb_wrap_struct.h"
 #include "soc/periph_defs.h" // for interrupt source
 
 #include "device/dcd.h"
@@ -165,26 +166,61 @@ void dcd_init(uint8_t rhport)
 {
   ESP_LOGV(TAG, "DCD init - Start");
 
-  // A. Disconnect
-  ESP_LOGV(TAG, "DCD init - Soft DISCONNECT and Setting up");
-  USB0.dctl |= USB_SFTDISCON_M; // Soft disconnect
+  // A. Wait for the core's AHB master to be idle before touching any CSR.
+  uint32_t tmo = 0;
+  while (!(USB0.grstctl & USB_AHBIDLE_M) && (++tmo < 10000000)) { }
+  if (!(USB0.grstctl & USB_AHBIDLE_M)) ESP_LOGE(TAG, "dcd_init: AHBIDLE wait timeout");
 
-  // B. Programming DCFG
+  // B. Force device mode BEFORE any device-block (0x800+) register is
+  //    programmed. Otherwise the OTG FSM may keep the core in host mode,
+  //    where device-block writes are silently dropped and the D+ pull-up
+  //    never reaches the bus. The force bit survives the core soft reset.
+  USB0.gusbcfg |= USB_FORCEDEVMODE_M;
+  if (!(USB0.gusbcfg & USB_FORCEDEVMODE_M))
+    ESP_LOGE(TAG, "dcd_init: FORCEDEVMODE lost (gusbcfg=0x%08x)", USB0.gusbcfg);
+
+  // C. Soft disconnect until the core is fully programmed.
+  USB0.dctl |= USB_SFTDISCON_M;
+  if (!(USB0.dctl & USB_SFTDISCON_M))
+    ESP_LOGE(TAG, "dcd_init: SFTDISCON lost (dctl=0x%08x)", USB0.dctl);
+
+  // D. Core soft reset. Flushes all state machines/FIFOs and makes the
+  //    forced mode take effect. GUSBCFG force bits, DCFG.DevSpd and
+  //    DCTL.SftDiscon survive this reset (databook), the rest is
+  //    reprogrammed below.
+  USB0.grstctl |= USB_CSFTRST_M;
+  tmo = 0;
+  while ((USB0.grstctl & USB_CSFTRST_M) && (++tmo < 10000000)) { }
+  if (USB0.grstctl & USB_CSFTRST_M) ESP_LOGE(TAG, "dcd_init: CSFTRST timeout");
+  tmo = 0;
+  while (!(USB0.grstctl & USB_AHBIDLE_M) && (++tmo < 10000000)) { }
+
+  // E. The core must now be in device mode.
+  ESP_LOGI(TAG, "dcd_init: gsnpsid=0x%08x gotgctl=0x%08x mode=%s conid=%u",
+           USB0.gsnpsid, USB0.gotgctl,
+           (USB0.gotgctl & USB_CURMOD_M) ? "host" : "device",
+           (USB0.gotgctl & USB_CONIDSTS_M) ? 1u : 0u);
+  if (USB0.gotgctl & USB_CURMOD_M)
+    ESP_LOGE(TAG, "dcd_init: still in host mode after force+soft reset");
+
+  // F. Programming DCFG
   /* If USB host misbehaves during status portion of control xfer
     (non zero-length packet), send STALL back and discard. Full speed. */
   USB0.dcfg |= USB_NZSTSOUTHSHK_M | // NonZero .... STALL
       (3 << 0);            // dev speed: fullspeed 1.1 on 48 mhz  // TODO no value in usb_reg.h (IDF-1476)
+  if ((USB0.dcfg & (USB_NZSTSOUTHSHK_M | 7)) != (USB_NZSTSOUTHSHK_M | 7))
+    ESP_LOGE(TAG, "dcd_init: DCFG lost (dcfg=0x%08x)", USB0.dcfg);
 
   USB0.gahbcfg |= USB_NPTXFEMPLVL_M | USB_GLBLLNTRMSK_M; // Global interruptions ON
-  USB0.gusbcfg |= USB_FORCEDEVMODE_M;                    // force devmode
+  USB0.gusbcfg |= USB_FORCEDEVMODE_M;                    // keep forced devmode
   USB0.gotgctl &= ~(USB_BVALIDOVVAL_M | USB_BVALIDOVEN_M | USB_VBVALIDOVVAL_M); //no overrides
 
-  // C. Setting SNAKs, then connect
+  // G. Setting SNAKs, then connect
   for (int n = 0; n < USB_OUT_EP_NUM; n++) {
     USB0.out_ep_reg[n].doepctl |= USB_DO_SNAK0_M; // DOEPCTL0_SNAK
   }
 
-  // D. Interruption masking
+  // H. Interruption masking
   USB0.gintmsk = 0;   //mask all
   USB0.gotgint = ~0U; //clear OTG ints
   USB0.gintsts = ~0U; //clear pending ints
@@ -197,6 +233,8 @@ void dcd_init(uint8_t rhport)
                  USB_ENUMDONEMSK_M |
                  USB_RESETDETMSK_M |
                  USB_DISCONNINTMSK_M; // host most only
+  if (USB0.gintmsk != (USB_OTGINTMSK_M | USB_MODEMISMSK_M | USB_RXFLVIMSK_M | USB_ERLYSUSPMSK_M | USB_USBSUSPMSK_M | USB_USBRSTMSK_M | USB_ENUMDONEMSK_M | USB_RESETDETMSK_M | USB_DISCONNINTMSK_M))
+    ESP_LOGE(TAG, "dcd_init: GINTMSK lost (gintmsk=0x%08x)", USB0.gintmsk);
 
   dcd_connect(rhport);
 }
@@ -231,6 +269,13 @@ void dcd_remote_wakeup(uint8_t rhport)
 void dcd_connect(uint8_t rhport)
 {
   (void) rhport;
+  // ESP32: hand the pad pulls back to the core (override off, no forced
+  // value) and then clear soft disconnect; the core drives the D+ pull-up.
+  USB_WRAP.otg_conf.pad_pull_override = 0;
+  USB_WRAP.otg_conf.dp_pullup = 0;
+  USB_WRAP.otg_conf.dp_pulldown = 0;
+  USB_WRAP.otg_conf.dm_pullup = 0;
+  USB_WRAP.otg_conf.dm_pulldown = 0;
   USB0.dctl &= ~USB_SFTDISCON_M;
 }
 
@@ -238,6 +283,12 @@ void dcd_connect(uint8_t rhport)
 void dcd_disconnect(uint8_t rhport)
 {
   (void) rhport;
+  // ESP32: DCTL.SFTDISCON alone is not a reliable disconnect on this
+  // silicon; force both pads down via USB_WRAP so the host sees the
+  // device fall off the bus.
+  USB_WRAP.otg_conf.pad_pull_override = 1;
+  USB_WRAP.otg_conf.dp_pulldown = 1;
+  USB_WRAP.otg_conf.dm_pulldown = 1;
   USB0.dctl |= USB_SFTDISCON_M;
 }
 

@@ -6,10 +6,12 @@
 namespace pm {
 namespace config {
 
-constexpr char kFirmwareVersion[] = "0.1.0";
+constexpr char kFirmwareVersion[] = "0.2.0";
 
 constexpr char kVaultMagic[] = "PMV1";
 constexpr char kExportMagic[] = "PMX1";
+// Версия формата экспорта PMX1. Растёт при несовместимом изменении структуры.
+constexpr uint32_t kExportVersion = 1;
 
 constexpr uint16_t kUsbVid = 0x303A;
 constexpr uint16_t kUsbPid = 0x4001;
@@ -68,7 +70,10 @@ constexpr uint32_t kDhcpLeaseSecs = 24 * 3600;
 constexpr uint8_t kMacFallback[6] = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x01};
 
 constexpr uint32_t kLogBaud = 115200;
-constexpr size_t kLogLineMax = 256;
+// 256 не хватало сердцебиению ncm: строка обрезалась на desc-счётчиках и
+// диагностика tx (q/cx/ps/ih) в лог не попадала вовсе. 320 покрывает полный
+// формат с запасом; буфер один, на стеке vwrite.
+constexpr size_t kLogLineMax = 320;
 constexpr size_t kPsramProbeBytes = 64 * 1024;
 
 constexpr uint16_t kHttpPort = 80;
@@ -120,9 +125,12 @@ constexpr uint32_t kMaxDigitAttempts = 256;
 // есть асинхронная модель 202 + опрос перестала бы работать. Ниже idle (0) опуститься
 // нельзя: тогда на том же ядре перестанет идти задача idle, а с ней и сброс WDT.
 constexpr uint32_t kAuthWorkerPriority = 4;
-// Стек воркера. begin() держит на стеке cand[2][kVaultHeaderBytes] = 512 Б плюс
-// несколько буферов по 32 Б; 6 КБ берут запас под кадры SHA-256 и залп в лог.
-constexpr uint32_t kAuthWorkerStackBytes = 6 * 1024;
+// Стек воркера. На нём всегда лежит Request целиком: password (256 Б) плюс
+// keyFile (kKeyFileMaxBytes = 4096 Б) — файл копируется в запрос, а не в
+// слот результата, поэтому 4.4 КБ заняты даже в простое. Плюс cand[2][256] в
+// begin(), снимки заголовков в rekey() и кадры SHA-256/PBKDF2. 12 КБ берут
+// запас под всё это; 6 КБ хватило бы только до появления keyFile в Request.
+constexpr uint32_t kAuthWorkerStackBytes = 12 * 1024;
 // Период проверки простоя сессии. Воркер просыпается по таймауту очереди и за
 // этим интервалом смотрит, не пора ли закрыть сессию по kSessionTtlMs. Отдельный
 // таймер не нужен: иначе его пришлось бы синхронизировать с состоянием сессии.
@@ -204,7 +212,7 @@ static_assert(kMasterPasswordChars == 38,
 // оборот записи заголовка не может оставить хранилище без заголовка вовсе.
 constexpr size_t kVaultPartitionBytes = 512 * 1024;
 // Заголовок занимает ровно одну страницу SPI flash (256 Б) при смещении,
-// кратном сектору. Так он записывается одной page program, а после его остаётся
+// кратном сектору. Так он записывается одной page program, а после него остаётся
 // место под маркер завершения записи: тег аутентификации не может быть последним
 // байтом, иначе его невозможно отличить от недописанного (см. kHdrCommit в
 // src/vault.cpp).
@@ -218,10 +226,9 @@ constexpr size_t kVaultRegion0Offset = kVaultHeaderSlotBytes * kVaultHeaderSlots
 constexpr size_t kVaultRegionBytes =
     ((kVaultPartitionBytes - kVaultRegion0Offset) / 2 / kFlashSectorBytes) *
     kFlashSectorBytes;
-constexpr size_t kVaultUsableBytes = kVaultRegionBytes;
 // Компакция при 50% области: активная область втрое больше живых данных, так
-// что места хватает в худшем случае — 192 КБ данных плюс 35 байт накладных на
-// каждую из 1000 записей это 226 КБ при доступных 252 КБ.
+// что места хватает в худшем случае — 192 КБ данных плюс накладные на
+// каждую из 1000 записей это ~232 КБ при доступных 252 КБ.
 constexpr size_t kVaultCompactTriggerBytes = kVaultRegionBytes / 2;
 
 // Жёсткий байтовый бюджет живых данных. Проверяется при каждом сохранении
@@ -229,15 +236,43 @@ constexpr size_t kVaultCompactTriggerBytes = kVaultRegionBytes / 2;
 // внятной ошибкой, а не приводит к тихой порче.
 constexpr size_t kVaultLiveBudgetBytes = 192 * 1024;
 
-// Три независимых инварианта ёмкости. 1000 записей по 1024 Б не помещаются
-// в 192 КБ: это 1000 записей со средней <= 196 Б, а 1024 Б — потолок для
-// отдельных крупных записей (их максимум тогда ~192).
-constexpr size_t kMaxEntryLen = 1024;
+// Три независимых инварианта ёмкости. 1000 записей по 1280 Б не помещаются
+// в 192 КБ: это 1000 записей со средней <= 176 Б, а 1280 Б — потолок для
+// отдельных крупных записей. Потолок payload (sizeof(Entry) - id) проверяется
+// static_assert'ом в include/vault.h.
+constexpr size_t kMaxEntryLen = 1280;
 constexpr uint32_t kMaxEntries = 1000;
 constexpr uint8_t kPasswordLenMin = 8;
 constexpr uint8_t kPasswordLenMax = 128;
 constexpr char kPasswordAlphabet[] =
     "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*()-_=+[]{}";
+
+// Ключевой файл. На устройстве НЕ хранится: клиент присылает его (base64)
+// при unlock/provision/rekey, KDF склеивает его SHA-256 с паролем, буфер
+// стирается после вывода ключа. Флаг presence — kFlagKeyfile (заголовок).
+constexpr size_t kKeyFileMaxBytes = 4096;
+
+// TOTP (RFC 6238). Секрет хранится в Entry::totp как base32-строка; алгоритм
+// фиксирован (SHA1, 6 цифр, 30 с) — параметры в otpauth URI не сохраняются,
+// потому что полный URI не влезает в kTotpSecretMax.
+constexpr size_t kTotpSecretMax = 64;
+constexpr size_t kTotpDigits = 6;
+constexpr uint32_t kTotpPeriodSec = 30;
+
+// Число импортируемых записей в одном запросе POST /api/import. Тело запроса
+// ограничено kHttpMaxBody (8 КБ), а запись в JSON с экранированием дорожает
+// до ~1.1 КБ — 4 записи укладываются с запасом.
+constexpr size_t kImportBatchEntries = 4;
+
+static_assert(kVaultRegion0Offset + 2 * kVaultRegionBytes == kVaultPartitionBytes,
+              "области журнала не покрывают раздел");
+static_assert(kVaultRegionBytes % kFlashSectorBytes == 0,
+              "область журнала не кратна сектору");
+static_assert(kVaultCompactTriggerBytes < kVaultRegionBytes,
+              "триггер компакции вне области");
+static_assert(kVaultLiveBudgetBytes + kMaxEntryLen + 64 <= kVaultRegionBytes,
+              "бюджет живых данных не оставляет места под компакцию");
+static_assert(kKeyFileMaxBytes <= 4096, "ключевой файл больше страницы флеша");
 
 // Каждый раздел монтируется на собственный базовый путь: корень "/" занят
 // (esp_vfs_register("/") -> ESP_ERR_INVALID_STATE).

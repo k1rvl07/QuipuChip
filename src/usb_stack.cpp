@@ -1,6 +1,7 @@
 #include "usb_stack.h"
 
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <string.h>
@@ -101,11 +102,22 @@ void usbTask(void* /*arg*/) {
     const Diag& d = pm::usb::diag();
     uint8_t nip[4] = {0, 0, 0, 0};
     pm::net_bridge::ip(nip);
+    // Диагностика зависшего TX. Три исхода картины «tx замёрз»:
+    //   q=0  — lwIP ничего не отдаёт: кадры не доходят до него (malloc в
+    //          onFrame падает) либо lwIP молчит;
+    //   q>0, cx=1 — pump() обязан транслировать, если не транслирует —
+    //          очередь/задача;
+    //   q>0, cx=0 — NTB заблокирован, хост не добирает IN-эндпоинт.
+    // ps — свободная PSRAM: карта «внезапно ничего не аллоцируется».
+    const uint32_t q = pm::net_bridge::txQueueWaiting();
+    const int cx = tud_network_can_xmit(64) ? 1 : 0;
+    const uint32_t ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const uint32_t ih = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     pm::log::info(
         "ncm rx %lu f/%lu B tx %lu f/%lu B drop %lu | link %d dhcp %d up %d step %s/%d "
         "ip %u.%u.%u.%u stk %lu | "
-        "ready %d mnt %d susp %d | gintsts %08x msk %08x dctl %08x chg %lu | "
-        "desc d %lu c %lu s %lu",
+        "ready %d mnt %d susp %d | gintsts %08x msk %08x dctl %08x dcfg %08x dsts %08x gotgctl %08x wrap %08x chg %lu | "
+        "desc d %lu c %lu s %lu s0 %lu s5 %lu l5 %lu | q %lu cx %d ps %lu ih %lu",
         static_cast<unsigned long>(s.rxFrames), static_cast<unsigned long>(s.rxBytes),
         static_cast<unsigned long>(s.txFrames), static_cast<unsigned long>(s.txBytes),
         static_cast<unsigned long>(s.txDropped), g.link ? 1 : 0,
@@ -115,10 +127,15 @@ void usbTask(void* /*arg*/) {
         static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)),
         tud_ready() ? 1 : 0, g.mounted ? 1 : 0, tud_suspended() ? 1 : 0,
         static_cast<unsigned>(gintsts), static_cast<unsigned>(USB0.gintmsk),
-        static_cast<unsigned>(USB0.dctl),
+        static_cast<unsigned>(USB0.dctl), static_cast<unsigned>(USB0.dcfg),
+        static_cast<unsigned>(USB0.dsts), static_cast<unsigned>(USB0.gotgctl),
+        static_cast<unsigned>(USB_WRAP.otg_conf.val),
         static_cast<unsigned long>(gintChanges),
         static_cast<unsigned long>(d.descDevice), static_cast<unsigned long>(d.descConfig),
-        static_cast<unsigned long>(d.descString));
+        static_cast<unsigned long>(d.descString), static_cast<unsigned long>(d.strLangidReqs),
+        static_cast<unsigned long>(d.strMacReqs), static_cast<unsigned long>(d.strMacLen),
+        static_cast<unsigned long>(q), cx, static_cast<unsigned long>(ps),
+        static_cast<unsigned long>(ih));
   }
 }
 
@@ -162,6 +179,16 @@ bool install() {
   cfg.external_phy = false;
 
   releaseUsbDomain();
+
+  // Прайм-чтения ДО tusb_init()/dcd_init(): состояние dwc2, которое застанет
+  // dcd_init. CURMOD (GOTGCTL bit21): 0=device, 1=host. Если ядро пришло в
+  // host-режиме, force+CSFTRST в dcd_init должны были его перевести.
+  pm::log::info("usb: prime gsnpsid %08x gotgctl %08x dctl %08x dcfg %08x grstctl %08x dsts %08x curmod %d conid %d",
+                static_cast<unsigned>(USB0.gsnpsid), static_cast<unsigned>(USB0.gotgctl),
+                static_cast<unsigned>(USB0.dctl), static_cast<unsigned>(USB0.dcfg),
+                static_cast<unsigned>(USB0.grstctl), static_cast<unsigned>(USB0.dsts),
+                (USB0.gotgctl & USB_CURMOD_M) ? 1 : 0,
+                (USB0.gotgctl & USB_CONIDSTS_M) ? 1 : 0);
 
   // helper ядра: usb_hal_init() (символ лежит в libhal.a) + пины + tusb_init().
   const esp_err_t err = tinyusb_driver_install(&cfg);

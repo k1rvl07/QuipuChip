@@ -18,6 +18,7 @@
       <div class="container header__inner">
         <h1 class="header__title">PassManager</h1>
         <div class="header__controls" id="headerControls" hidden>
+          <button id="btnRekey" class="btn btn--ghost" title="Сменить мастер-пароль">Сменить пароль</button>
           <button id="btnLock" class="btn btn--ghost" title="Заблокировать хранилище">Заблокировать</button>
           <button id="btnReset" class="btn btn--danger-ghost" title="Полностью сбросить устройство">Сбросить</button>
         </div>
@@ -31,7 +32,15 @@
           <h2 class="card__title">Первичная настройка</h2>
           <p class="card__text">Устройство ещё не настроено. Создайте хранилище — мастер-пароль будет сгенерирован
             автоматически и показан один раз.</p>
-          <button id="btnProvision" class="btn btn--primary btn--lg">Создать хранилище</button>
+          <div class="form form--column">
+            <label class="label" for="inputSetupKeyfile">Ключевой файл (необязательно)</label>
+            <input id="inputSetupKeyfile" type="file" class="input input--file" />
+            <p class="card__hint">Если выбрать файл, он будет требоваться при каждом входе. Максимум 4096 байт.
+              Без файла вход будет только по мастер-паролю.</p>
+            <div class="form__actions">
+              <button id="btnProvision" class="btn btn--primary btn--lg">Создать хранилище</button>
+            </div>
+          </div>
           <div id="setupStatus" class="status" hidden></div>
         </div>
 
@@ -60,7 +69,12 @@
           <form id="formUnlock" class="form form--column">
             <label class="label" for="inputUnlock">Мастер-пароль</label>
             <input id="inputUnlock" type="password" class="input input--mono" autocomplete="current-password"
-              spellcheck="false" placeholder="••••••••••••••••••••••••••••••••••••••" />
+              spellcheck="false" placeholder="•••••••••••••••••••••••••••••••••" />
+            <div id="unlockKeyfileBlock" class="form-field" hidden>
+              <label class="label" for="inputUnlockKeyfile">Ключевой файл</label>
+              <input id="inputUnlockKeyfile" type="file" class="input input--file" />
+              <p class="card__hint">Хранилище настроено на вход с файлом-ключом.</p>
+            </div>
             <div class="form__actions">
               <button id="btnUnlock" type="submit" class="btn btn--primary btn--lg">Разблокировать</button>
             </div>
@@ -77,12 +91,22 @@
       <section id="screenApp" class="screen" hidden>
         <div class="toolbar">
           <div class="toolbar__left">
-            <input id="searchInput" type="search" class="input input--search" placeholder="Поиск по названию, логину, URL"
-              autocomplete="off" />
+            <input id="searchInput" type="search" class="input input--search"
+              placeholder="Поиск по названию, логину, URL, тегам" autocomplete="off" />
           </div>
           <div class="toolbar__right">
             <button id="btnNew" class="btn btn--primary">Добавить запись</button>
             <button id="btnRefresh" class="btn btn--ghost">Обновить</button>
+            <button id="btnExport" class="btn btn--ghost" title="Выгрузить всё хранилище в файл PMX1">Экспорт
+              PMX1</button>
+            <label class="btn btn--ghost btn--file" for="inputImportFile"
+              title="Импорт записей из файла PMX1 (файлы по 4 записи за раз)">Импорт PMX1</label>
+            <input id="inputImportFile" type="file" accept="application/json,.json" hidden />
+            <button id="btnExportKdbx" class="btn btn--ghost"
+              title="Выгрузить хранилище в файл KeePass (.kdbx)">Экспорт .kdbx</button>
+            <label class="btn btn--ghost btn--file" for="inputImportKdbxFile"
+              title="Импорт записей из файла KeePass (.kdbx)">Импорт .kdbx</label>
+            <input id="inputImportKdbxFile" type="file" accept=".kdbx" hidden />
           </div>
         </div>
 
@@ -105,14 +129,14 @@
           <div class="modal__body">
             <div class="form-grid">
               <div class="form-field">
-                <label class="label" for="entryTitle">Название *</label>
+                <label class="label" for="entryTitle">Название</label>
                 <input id="entryTitle" type="text" class="input" autocomplete="off" spellcheck="false"
-                  placeholder="Например, Google" />
+                  maxlength="47" placeholder="Например, Google" />
               </div>
               <div class="form-field">
-                <label class="label" for="entryLogin">Логин *</label>
+                <label class="label" for="entryLogin">Логин</label>
                 <input id="entryLogin" type="text" class="input" autocomplete="username" spellcheck="false"
-                  placeholder="user@example.com" />
+                  maxlength="95" placeholder="user@example.com" />
               </div>
               <div class="form-field form-field--password">
                 <label class="label" for="entryPassword">Пароль</label>
@@ -121,10 +145,13 @@
                     spellcheck="false" placeholder="Введите или сгенерируйте" />
                   <div class="password-field__actions password-field__actions--inline">
                     <button type="button" id="btnGenPass" class="btn btn--ghost btn--sm">Сгенерировать</button>
+                    <button type="button" id="btnGenPhrase" class="btn btn--ghost btn--sm"
+                      title="Сгенерировать фразу генератором устройства">Фраза с устройства</button>
                     <button type="button" id="btnTogglePass" class="btn btn--ghost btn--sm">Показать</button>
                     <button type="button" id="btnCopyPass" class="btn btn--ghost btn--sm">Скопировать</button>
                   </div>
                 </div>
+                <p class="card__hint" id="entryPasswordHint" hidden>Пусто — пароль записи не меняется.</p>
                 <div class="generator" id="genOpts" hidden>
                   <div class="generator__row">
                     <label class="label label--inline">Длина: <span id="genLenVal">16</span></label>
@@ -140,11 +167,23 @@
               </div>
               <div class="form-field">
                 <label class="label" for="entryUrl">URL</label>
-                <input id="entryUrl" type="url" class="input" spellcheck="false" placeholder="https://example.com" />
+                <input id="entryUrl" type="url" class="input" spellcheck="false" maxlength="191"
+                  placeholder="https://example.com" />
+              </div>
+              <div class="form-field">
+                <label class="label" for="entryTags">Теги</label>
+                <input id="entryTags" type="text" class="input" spellcheck="false" maxlength="127"
+                  placeholder="через запятую: work, mail" />
+              </div>
+              <div class="form-field">
+                <label class="label" for="entryTotp">TOTP-секрет</label>
+                <input id="entryTotp" type="text" class="input input--mono" spellcheck="false" maxlength="63"
+                  placeholder="Base32 без пробелов, напр. GEZDGNBV…" autocomplete="off" />
+                <p class="card__hint">Необязательно. Коды будут считаться на устройстве по коду из секрета.</p>
               </div>
               <div class="form-field form-field--full">
                 <label class="label" for="entryNote">Заметки</label>
-                <textarea id="entryNote" class="input" rows="3" spellcheck="false"
+                <textarea id="entryNote" class="input" rows="3" spellcheck="false" maxlength="399"
                   placeholder="Дополнительная информация"></textarea>
               </div>
             </div>
@@ -154,6 +193,131 @@
             <div class="modal__spacer"></div>
             <button type="button" id="btnEntryCancel" class="btn btn--ghost">Отмена</button>
             <button type="submit" id="btnEntrySave" class="btn btn--primary">Сохранить</button>
+          </footer>
+        </form>
+      </dialog>
+
+      <!-- Модалка: просмотр записи -->
+      <dialog id="modalView" class="modal">
+        <div class="modal__content">
+          <header class="modal__header">
+            <h3 id="viewTitle" class="modal__title">Запись</h3>
+            <button type="button" id="btnViewClose" class="btn btn--icon" title="Закрыть">✕</button>
+          </header>
+          <div class="modal__body" id="viewBody"></div>
+          <footer class="modal__footer">
+            <button type="button" id="btnViewTotp" class="btn btn--ghost" hidden>Показать код TOTP</button>
+            <div class="modal__spacer"></div>
+            <button type="button" id="btnViewEdit" class="btn btn--ghost">Редактировать</button>
+            <button type="button" id="btnViewClose2" class="btn btn--primary">Закрыть</button>
+          </footer>
+        </div>
+      </dialog>
+
+      <!-- Модалка: смена мастер-пароля -->
+      <dialog id="modalRekey" class="modal">
+        <form method="dialog" id="formRekey" class="modal__content">
+          <header class="modal__header">
+            <h3 class="modal__title">Смена мастер-пароля</h3>
+            <button type="button" id="btnRekeyClose" class="btn btn--icon" title="Закрыть">✕</button>
+          </header>
+          <div class="modal__body">
+            <p class="card__text">Хранилище будет перешифровано под новый мастер-пароль. Записи и текущая сессия
+              сохранятся. Старый пароль после смены не действует.</p>
+            <div class="form-field">
+              <label class="label" for="inputRekeyPassword">Новый мастер-пароль</label>
+              <div class="password-field">
+                <input id="inputRekeyPassword" type="password" class="input input--mono" autocomplete="new-password"
+                  spellcheck="false" placeholder="Введите или сгенерируйте" />
+                <div class="password-field__actions password-field__actions--inline">
+                  <button type="button" id="btnRekeyGen" class="btn btn--ghost btn--sm"
+                    title="Сгенерировать мастер-пароль генератором устройства">Сгенерировать</button>
+                  <button type="button" id="btnRekeyToggle" class="btn btn--ghost btn--sm">Показать</button>
+                </div>
+              </div>
+            </div>
+            <div class="form-field">
+              <label class="label" for="inputRekeyKeyfile">Ключевой файл (необязательно)</label>
+              <input id="inputRekeyKeyfile" type="file" class="input input--file" />
+              <p class="card__hint" id="rekeyKeyfileHint"></p>
+            </div>
+            <div id="rekeyStatus" class="status" hidden></div>
+          </div>
+          <footer class="modal__footer">
+            <button type="button" id="btnRekeyCancel" class="btn btn--ghost">Отмена</button>
+            <button type="submit" id="btnRekeySubmit" class="btn btn--primary">Сменить пароль</button>
+          </footer>
+        </form>
+      </dialog>
+
+      <!-- Модалка: импорт из .kdbx -->
+      <dialog id="modalKdbxImport" class="modal">
+        <form method="dialog" id="formKdbxImport" class="modal__content">
+          <header class="modal__header">
+            <h3 class="modal__title">Импорт из .kdbx</h3>
+            <button type="button" id="btnKdbxImportClose" class="btn btn--icon" title="Закрыть">✕</button>
+          </header>
+          <div class="modal__body">
+            <div id="kdbxImportPhase1">
+              <div class="form-grid">
+                <div class="form-field form-field--full">
+                  <label class="label" for="inputKdbxFile">Файл KeePass (.kdbx)</label>
+                  <input id="inputKdbxFile" type="file" class="input input--file" accept=".kdbx" />
+                </div>
+                <div class="form-field">
+                  <label class="label" for="inputKdbxPassword">Пароль базы</label>
+                  <input id="inputKdbxPassword" type="password" class="input input--mono" autocomplete="off"
+                    spellcheck="false" placeholder="пароль открытия файла" />
+                </div>
+                <div class="form-field">
+                  <label class="label" for="inputKdbxKeyfile">Ключевой файл базы (необязательно)</label>
+                  <input id="inputKdbxKeyfile" type="file" class="input input--file" />
+                </div>
+              </div>
+              <div id="kdbxImportStatus" class="status" hidden></div>
+            </div>
+            <div id="kdbxImportPhase2" hidden>
+              <p id="kdbxImportSummary" class="card__text"></p>
+              <div id="kdbxImportList" class="entry-card__badges"></div>
+              <p id="kdbxImportSkip" class="card__hint" hidden></p>
+              <div id="kdbxImportStatus2" class="status" hidden></div>
+            </div>
+          </div>
+          <footer class="modal__footer">
+            <button type="button" id="btnKdbxImportBack" class="btn btn--ghost" hidden>Назад</button>
+            <div class="modal__spacer"></div>
+            <button type="button" id="btnKdbxImportCancel" class="btn btn--ghost">Отмена</button>
+            <button type="submit" id="btnKdbxImportNext" class="btn btn--primary">Открыть базу</button>
+          </footer>
+        </form>
+      </dialog>
+
+      <!-- Модалка: экспорт в .kdbx -->
+      <dialog id="modalKdbxExport" class="modal">
+        <form method="dialog" id="formKdbxExport" class="modal__content">
+          <header class="modal__header">
+            <h3 class="modal__title">Экспорт в .kdbx</h3>
+            <button type="button" id="btnKdbxExportClose" class="btn btn--icon" title="Закрыть">✕</button>
+          </header>
+          <div class="modal__body">
+            <p class="card__text">Файл KeePass защищается этим паролем. Пароль нигде не сохраняется — потеря
+              пароля означает потерю доступа к файлу.</p>
+            <div class="form-field">
+              <label class="label" for="inputKdbxExportPassword">Пароль файла</label>
+              <div class="password-field">
+                <input id="inputKdbxExportPassword" type="password" class="input input--mono" autocomplete="off"
+                  spellcheck="false" placeholder="введите или сгенерируйте" />
+                <div class="password-field__actions password-field__actions--inline">
+                  <button type="button" id="btnKdbxExportGen" class="btn btn--ghost btn--sm">Сгенерировать</button>
+                  <button type="button" id="btnKdbxExportToggle" class="btn btn--ghost btn--sm">Показать</button>
+                </div>
+              </div>
+            </div>
+            <div id="kdbxExportStatus" class="status" hidden></div>
+          </div>
+          <footer class="modal__footer">
+            <button type="button" id="btnKdbxExportCancel" class="btn btn--ghost">Отмена</button>
+            <button type="submit" id="btnKdbxExportSubmit" class="btn btn--primary">Скачать .kdbx</button>
           </footer>
         </form>
       </dialog>
