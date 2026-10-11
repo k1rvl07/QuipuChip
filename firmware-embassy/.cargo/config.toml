@@ -1,0 +1,23 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+# Pin GNU ld >= 2.43.1 from the espup toolchain. The otherwise-convenient
+# PlatformIO `toolchain-xtensa-esp32s3` ships GNU ld 2.35.1, which mis-sizes the
+# esp-hal NOLOAD dummy sections and shifts `.data` by 0x40 in the image, so all
+# `match`->`&str` constants come up as garbage and the boot hangs (see AGENTS.md
+# "firmware-embassy: старый GNU ld калечит образ").
+# Refresh the version segment after `espup install` / `espup update`.
+linker = "/home/k1rvl/.rustup/toolchains/esp/xtensa-esp-elf/esp-16.2.0_20260914/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+rustflags = [
+  # GNU LD
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+]
+
+[env]
+ESP_LOG = "info"
+
+[unstable]
+build-std = ["core", "alloc"]

@@ -838,13 +838,13 @@
   }
 
   function rekeyKeyfileHint() {
-    const hasFile = el('inputRekeyKeyfile').files && el('inputRekeyKeyfile').files.length > 0;
+    const hasNew = el('inputRekeyKeyfile').files && el('inputRekeyKeyfile').files.length > 0;
     let text;
-    if (state.keyfileRequired && hasFile) {
-      text = 'Файл останется обязателен при входе.';
-    } else if (state.keyfileRequired && !hasFile) {
-      text = 'Сейчас вход с файлом. Файл не выбран — после смены вход будет только по паролю.';
-    } else if (!state.keyfileRequired && hasFile) {
+    if (state.keyfileRequired && hasNew) {
+      text = 'Файл будет заменён на выбранный; для входа потребуется новый файл.';
+    } else if (state.keyfileRequired && !hasNew) {
+      text = 'Текущий ключевой файл останется прежним.';
+    } else if (!state.keyfileRequired && hasNew) {
       text = 'После смены вход будет требовать этот файл.';
     } else {
       text = 'Вход по паролю без файла — как сейчас.';
@@ -858,6 +858,11 @@
     }
     const st = el('rekeyStatus');
     hideStatus(st);
+    const oldPw = el('inputRekeyOldPassword').value;
+    if (!oldPw) {
+      statusOf(st, 'error', 'Введите текущий мастер-пароль');
+      return;
+    }
     const pw = el('inputRekeyPassword').value;
     if (!pw) {
       statusOf(st, 'error', 'Введите новый мастер-пароль');
@@ -870,14 +875,24 @@
     const btn = el('btnRekeySubmit');
     btn.disabled = true;
     try {
+      const body = { old_password: oldPw, password: pw };
+      if (state.keyfileRequired) {
+        const cur = await readKeyfile(el('inputRekeyCurrentKeyfile'), state.keyFileMaxBytes);
+        if (cur.absent) {
+          statusOf(st, 'error', 'Выберите текущий ключевой файл');
+          return;
+        }
+        body.keyfile_current = cur.b64;
+      }
       const kf = await readKeyfile(el('inputRekeyKeyfile'), state.keyFileMaxBytes);
-      const body = { password: pw };
       if (!kf.absent) {
-        body.keyfile = kf.b64;
+        body.keyfile_action = 'set';
+        body.keyfile_new = kf.b64;
       }
       await submitJob('/api/auth/rekey', body);
       await fetchState();
       statusOf(st, 'ok', 'Мастер-пароль изменён. Хранилище перешифровано.');
+      el('inputRekeyOldPassword').value = '';
       el('inputRekeyPassword').value = '';
       updateFooter();
       setTimeout(() => {
@@ -1408,10 +1423,13 @@
     });
 
     el('btnRekey').addEventListener('click', () => {
+      el('inputRekeyOldPassword').value = '';
       el('inputRekeyPassword').value = '';
       el('inputRekeyPassword').type = 'password';
       el('btnRekeyToggle').textContent = 'Показать';
+      el('inputRekeyCurrentKeyfile').value = '';
       el('inputRekeyKeyfile').value = '';
+      el('rekeyCurrentKeyfileBlock').hidden = !state.keyfileRequired;
       hideStatus(el('rekeyStatus'));
       rekeyKeyfileHint();
       el('modalRekey').showModal();

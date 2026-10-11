@@ -1,0 +1,59 @@
+[package]
+name = "firmware-embassy"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+embassy-executor = "0.10.0"
+embassy-sync = "0.8"
+embassy-time = "0.5"
+embassy-usb = { version = "0.6.0", default-features = false }
+embassy-net = { version = "0.9", default-features = false, features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "tcp",
+    "udp",
+] }
+esp-hal = { version = "1.2", features = ["log-04", "unstable"] }
+esp-rtos = { version = "0.4", features = ["embassy", "log-04"] }
+esp-backtrace = { version = "0.20", features = ["panic-handler", "println"] }
+esp-println = { version = "0.18", default-features = false, features = ["uart", "log-04", "esp32s3"] }
+esp-bootloader-esp-idf = "0.6"
+esp-alloc = { version = "0.11", features = ["esp32s3"] }
+esp-storage = { version = "0.10", features = ["esp32s3"] }
+pm-core = { path = "../core" }
+edge-dhcp = "0.8.0"
+edge-nal = "0.7.0"
+edge-nal-embassy = "0.9.0"
+picoserve = { version = "0.19", default-features = false, features = ["embassy", "alloc"] }
+static_cell = "2.1.0"
+log = "0.4"
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[features]
+esp32s3 = [
+    "esp-backtrace/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-rtos/esp32s3",
+    "esp-hal/esp32s3",
+]
+# Enables the destructive stage 4a/5 selftest on every boot (wipes the vault
+# partition). Off by default: a plain build must never erase user data.
+selftest = []
+
+[profile.release]
+debug = true
+debug-assertions = true
+opt-level = 2
+# NOTE: With `lto = "fat"` all of .data comes up as garbage on Xtensa:
+# ESP_HAL_LOCK's owner word is never initialized, Peripherals::take() spins
+# forever in esp-sync's multi_core RawMutex and the RTC watchdog resets.
+# The real culprit is the old PlatformIO GNU ld 2.35.1, which mis-sizes the
+# NOLOAD dummy sections and shifts the image. Use GNU ld >= 2.43.1 (esp-14.2.0,
+# see AGENTS.md "старый GNU ld калечит образ"). LTO with a correct linker is
+# untested; keep it off until re-verified on hardware.
+lto = false
+codegen-units = 1

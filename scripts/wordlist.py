@@ -6,7 +6,7 @@
 удобства», либо ломает счёт (4097 слов = 12.0004 бита на слово вместо ровно
 12), либо молча ослабляет гарантию. Проверять это вручную нельзя, поэтому
 список собирается скриптом, валидатор проверяет ограничения, а результат
-кладётся в include/wordlist.h и живёт дальше как обычный заголовочный файл.
+кладётся в core/src/wordlist.rs и живёт дальше как обычный исходный файл.
 
 Слова СИНТЕТИЧЕСКИЕ, а не словариковые, и непроизносимые. Причина не в лени,
 а в требовании к расстоянию Хэмминга: ошибиться на 1-2 буквы в passphrase,
@@ -26,8 +26,8 @@
 вроде «xkqtw» не выглядят как английские. Причина — в MIN_HAMMING ниже.
 
 Запуск:
-    python3 scripts/wordlist.py            пересобрать include/wordlist.h
-    python3 scripts/wordlist.py --check    проверить, что заголовок соответствует
+    python3 scripts/wordlist.py            пересобрать core/src/wordlist.rs
+    python3 scripts/wordlist.py --check    проверить, что файл соответствует
                                            генератору (для CI и ревью)
 """
 
@@ -264,134 +264,65 @@ def validate(words: list) -> None:
           f"мин. расстояние {MIN_HAMMING}")
 
 
-def _word_rows(words: list, indent: str) -> list:
-    """Строки со словами. Слова идут подряд, доступ — по фиксированной длине.
+def render_rust(words: list) -> str:
+    """Печатает core/src/wordlist.rs — таблицу для Rust-ядра.
 
-    Так вместо массива из 4096 указателей (16 КБ .rodata на каждый включающий
-    TU) идёт одна строка 24 КБ, и разрядность индекса не зависит от того, откуда
-    взяли слово.
+    Раскладка бит-совместима с C++: одна строка, слово из 5 букв плюс NUL
+    (stride 6). Строковый литерал продолжается обратным слэшем в конце строки,
+    который в Rust съедает перевод строки и следующий отступ, поэтому переносы
+    только косметические и на содержимое не влияют.
     """
-    stride = WORD_BYTES + 1  # плюс терминатор
-    # Ровно 12 слов на строку: 12*6 = 72 символа данных плюс кавычки и пробелы
-    # укладываются в 80 колонок без переноса посередине слова.
-    per_line = 12
-    rows = []
-    for i in range(0, len(words), per_line):
-        chunk = "".join(w + "\0" for w in words[i:i + per_line])
-        # NUL на границе слова пишем escape-последовательностью \0 и сам байт
-        # НЕ добавляем: f"\\0{c}" подставил бы и escape, и сам NUL, и строка в
-        # C обрывалась бы на первом же слове. Здесь c не используется вовсе.
-        esc = "".join(
-            "\\0" if (c == "\0" and j % stride == stride - 1) else c
-            for j, c in enumerate(chunk)
-        )
-        rows.append(f'{indent}"{esc}"')
-    rows.append(indent + ";")
-    return rows
-
-
-# Объявление таблицы вынесено из определения намеренно, и на то были причины.
-# Первая версия держала `const char kWords[]` прямо в заголовке — у такой
-# декларации ВНУТРЕННЯЯ связность, и каждый включающий TU получал свою копию
-# 24 КБ. Затем попробовали `inline const char kWords[]`: это уже одна копия, но
-# C++17, а проект собирается gnu++11, и gcc предупреждал "inline variables are
-# only available with -std=c++17". Поднимать стандарт ради таблицы нельзя, это
-# задевает компиляцию ядра Arduino. Третья попытка — литерал внутри
-# `inline constexpr const char* words()` — формально чистая, но строковые
-# литералы функций линкер не склеивает: флеш вырос на 24.6 КБ, ровно на лишний
-# TU. Четвёртая, шаблон-носитель Words<void>, не линковалась вовсе: static
-# constexpr в классе требует определителя, а определить специализацию шаблона
-# вне класса в C++11 нельзя (только в C++17).
-#
-# Остаётся классика: extern-объявление здесь, ровно одно определение в .cpp.
-# Одна копия на программу при любом числе включающих файлов, и компилятор молчит.
-WORDLIST_DECL = """// Таблица слов. Определена ровно один раз, в src/wordlist.cpp.
-extern const char kWords[];
-
-// Слово по индексу: возврат указателя на нуль-терминированную строку.
-constexpr const char* word(size_t i) {
-  return kWords + i * kWordStride;
-}
-"""
-
-
-def render(words: list) -> str:
-    """Печатает include/wordlist.h."""
     stride = WORD_BYTES + 1
+    per_line = 12
+    chunks = [
+        "".join(w + r"\0" for w in words[i:i + per_line])
+        for i in range(0, len(words), per_line)
+    ]
     out = []
-    out.append("#pragma once")
+    out.append("//! Мастер-словарь, сгенерирован scripts/wordlist.py. Правь скрипт,")
+    out.append("//! не этот файл:")
+    out.append("//!     python3 scripts/wordlist.py")
+    out.append("//!     python3 scripts/wordlist.py --check")
+    out.append("//!")
+    out.append(f"//! {WORD_COUNT} слов по {WORD_BYTES} букв, {len(words).bit_length() - 1} бит на слово,")
+    out.append(f"//! минимальное расстояние Хэмминга {MIN_HAMMING}.")
+    out.append("//!")
+    out.append("//! Таблица — одна байтовая строка с NUL после каждого слова (stride 6),")
+    out.append("//! поэтому индекс слова не зависит от его позиции.")
     out.append("")
-    out.append("// Файл сгенерирован scripts/wordlist.py. Правь скрипт, не эти файлы:")
-    out.append("//     python3 scripts/wordlist.py")
-    out.append("//     python3 scripts/wordlist.py --check   # проверка без записи")
-    out.append("//")
-    out.append(f"// {WORD_COUNT} слов по {WORD_BYTES} букв, {len(words).bit_length() - 1} бит на слово.")
-    out.append(f"// Минимальное расстояние Хэмминга {MIN_HAMMING}: промах в 1-2 буквы не может дать")
-    out.append("// другое слово словаря, то есть опечатка обнаруживается сама.")
-    out.append("// Слова непроизносимые и это осознанное: с расстоянием 3 в произносимом")
-    out.append(f"// семействе CVC потолок {125 * 16} слов, а нужно {WORD_COUNT}.")
-    out.append("// Словом выбирается равномерный индекс, а не слово из словаря.")
-    out.append("//")
-    out.append("// Таблица объявлена extern и ОПРЕДЕЛЕНА один раз, в src/wordlist.cpp:")
-    out.append("// иначе каждый включающий TU тащил бы свою копию 24 КБ. Подробности")
-    out.append("// о выборе этого приёма — в scripts/wordlist.py.")
+    out.append(f"pub const WORD_COUNT: usize = {WORD_COUNT};")
+    out.append(f"pub const WORD_BYTES: usize = {WORD_BYTES};")
+    out.append(f"pub const WORD_STRIDE: usize = {stride};")
     out.append("")
-    out.append("#include <stddef.h>")
+    out.append(f"/// {WORD_COUNT} слов по {WORD_BYTES} букв, за каждым NUL.")
+    out.append("pub static WORDS: &[u8; WORD_COUNT * WORD_STRIDE] = b\"\\")
+    for idx, chunk in enumerate(chunks):
+        tail = "\\" if idx < len(chunks) - 1 else "\";"
+        out.append(f"    {chunk}{tail}")
     out.append("")
-    out.append("namespace pm {")
-    out.append("namespace wordlist {")
-    out.append("")
-    out.append(f"constexpr size_t kWordCount = {WORD_COUNT};")
-    out.append(f"constexpr size_t kWordBytes = {WORD_BYTES};")
-    out.append(f"constexpr size_t kWordStride = {stride};")
-    out.append("")
-    out.append(WORDLIST_DECL.rstrip())
-    out.append("")
-    out.append("}  // namespace wordlist")
-    out.append("}  // namespace pm")
-    out.append("")
-    return "\n".join(out)
-
-
-def render_source(words: list) -> str:
-    """Печатает src/wordlist.cpp — единственное определение таблицы."""
-    out = []
-    out.append("// Файл сгенерирован scripts/wordlist.py. Правь скрипт, не этот файл:")
-    out.append("//     python3 scripts/wordlist.py")
-    out.append("//     python3 scripts/wordlist.py --check   # проверка без записи")
-    out.append("//")
-    out.append("// Единственное место, где таблица слов существует как объект. Заголовок")
-    out.append("// объявляет её extern, поэтому 24 КБ словаря попадают в прошивку РОВНО")
-    out.append("// один раз, сколько бы файлов его ни включали.")
-    out.append("")
-    out.append('#include "wordlist.h"')
-    out.append("")
-    out.append("namespace pm {")
-    out.append("namespace wordlist {")
-    out.append("")
-    out.append("const char kWords[] =")
-    out.extend(_word_rows(words, "    "))
-    out.append("")
-    out.append("}  // namespace wordlist")
-    out.append("}  // namespace pm")
+    out.append("/// Слово по индексу без завершающего NUL.")
+    out.append("#[inline]")
+    out.append("pub fn word(i: usize) -> &'static [u8] {")
+    out.append("    let start = i * WORD_STRIDE;")
+    out.append("    &WORDS[start..start + WORD_BYTES]")
+    out.append("}")
     out.append("")
     return "\n".join(out)
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-HEADER = ROOT / "include" / "wordlist.h"
-SOURCE = ROOT / "src" / "wordlist.cpp"
+RUST = ROOT / "core" / "src" / "wordlist.rs"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true",
-                    help="только проверить заголовок, ничего не записывать")
+                    help="только проверить сгенерированный файл, ничего не записывать")
     args = ap.parse_args()
 
     words = build_words()
     validate(words)
-    outputs = {HEADER: render(words), SOURCE: render_source(words)}
+    outputs = {RUST: render_rust(words)}
 
     if args.check:
         stale = []

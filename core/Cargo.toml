@@ -1,0 +1,15 @@
+[package]
+name = "pm-core"
+version = "0.1.0"
+edition = "2021"
+description = "Portable, host-testable core: PMV1 vault format, crypto, entries, PMX1 export"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+subtle = { version = "2", default-features = false }

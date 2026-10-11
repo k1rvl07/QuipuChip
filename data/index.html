@@ -225,6 +225,11 @@
             <p class="card__text">Хранилище будет перешифровано под новый мастер-пароль. Записи и текущая сессия
               сохранятся. Старый пароль после смены не действует.</p>
             <div class="form-field">
+              <label class="label" for="inputRekeyOldPassword">Текущий мастер-пароль</label>
+              <input id="inputRekeyOldPassword" type="password" class="input input--mono"
+                autocomplete="current-password" spellcheck="false" placeholder="Введите текущий пароль" />
+            </div>
+            <div class="form-field">
               <label class="label" for="inputRekeyPassword">Новый мастер-пароль</label>
               <div class="password-field">
                 <input id="inputRekeyPassword" type="password" class="input input--mono" autocomplete="new-password"
@@ -236,8 +241,12 @@
                 </div>
               </div>
             </div>
+            <div class="form-field" id="rekeyCurrentKeyfileBlock" hidden>
+              <label class="label" for="inputRekeyCurrentKeyfile">Текущий ключевой файл</label>
+              <input id="inputRekeyCurrentKeyfile" type="file" class="input input--file" />
+            </div>
             <div class="form-field">
-              <label class="label" for="inputRekeyKeyfile">Ключевой файл (необязательно)</label>
+              <label class="label" for="inputRekeyKeyfile">Новый ключевой файл (необязательно)</label>
               <input id="inputRekeyKeyfile" type="file" class="input input--file" />
               <p class="card__hint" id="rekeyKeyfileHint"></p>
             </div>
