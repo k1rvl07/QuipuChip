@@ -19,7 +19,7 @@ use alloc::vec;
 use core::cell::RefCell;
 
 use esp_storage::FlashStorage;
-use pm_core::entry::VaultError;
+use pm_core::types::VaultError;
 use pm_core::vault::Storage;
 
 const WORD: usize = FlashStorage::WORD_SIZE as usize;
@@ -50,6 +50,11 @@ impl VaultStorage {
 
     pub fn base(&self) -> u32 {
         self.base
+    }
+
+    /// Size in bytes of the wrapped partition region.
+    pub fn size(&self) -> usize {
+        self.size
     }
 }
 

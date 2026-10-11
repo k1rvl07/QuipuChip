@@ -1,4 +1,4 @@
-//! Authorization layer, ported from `auth.cpp`.
+//! Authorization layer, ported from the removed C++ reference.
 //!
 //! Provisioning, unlock, session handling and failure lockout. The module knows
 //! nothing about HTTP and never touches the network itself: secrets (the
@@ -20,9 +20,10 @@ use crate::config::{
     SESSION_TOKEN_LEN, SESSION_TTL_MS,
 };
 use crate::crypto;
-use crate::entry::VaultError;
+use crate::hex;
 use crate::password::generate_password;
 use crate::rand::RandomSource;
+use crate::types::VaultError;
 use crate::vault::{Storage, Vault};
 
 /// Length of the session token as it travels on the wire: 32 bytes in hex.
@@ -35,6 +36,17 @@ pub enum Job {
     Unlock = 1,
     Reset = 2,
     Rekey = 3,
+}
+
+impl Job {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Job::Provision => "provision",
+            Job::Unlock => "unlock",
+            Job::Reset => "reset",
+            Job::Rekey => "rekey",
+        }
+    }
 }
 
 /// Outcome of an operation. `Pending` and `Busy` are not errors.
@@ -177,7 +189,6 @@ struct Slot {
     id: JobId,
     kind: Job,
     result: JobResult,
-    in_flight: bool,
     /// One-shot provisioning password, wiped on first poll / next submit.
     password: Vec<u8>,
     /// One-shot session token (hex ASCII).
@@ -190,7 +201,6 @@ impl Slot {
             id: NO_JOB,
             kind: Job::Provision,
             result: JobResult::Pending,
-            in_flight: false,
             password: Vec::new(),
             session_token: Vec::new(),
         }
@@ -310,14 +320,14 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         let mut req = Request::new(Job::Rekey);
         req.keyfile_action = action;
         req.old_password.extend_from_slice(old_password.as_bytes());
-        if let Some(np) = new_password {
-            if !np.is_empty() {
-                if np.len() >= MAX_PASS_CHARS {
-                    return (NO_JOB, None);
-                }
-                req.password.extend_from_slice(np.as_bytes());
-                req.has_new_password = true;
+        if let Some(np) = new_password
+            && !np.is_empty()
+        {
+            if np.len() >= MAX_PASS_CHARS {
+                return (NO_JOB, None);
             }
+            req.password.extend_from_slice(np.as_bytes());
+            req.has_new_password = true;
         }
         req.key_file.extend_from_slice(cur_key_file);
         req.key_file_new.extend_from_slice(new_key_file);
@@ -343,7 +353,6 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         self.slot.id = id;
         self.slot.kind = req.kind;
         self.slot.result = JobResult::Pending;
-        self.slot.in_flight = true;
         self.busy = true;
         req.id = id;
         (id, Some(req))
@@ -374,7 +383,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         let kf = keyfile_opt(&req.key_file);
         let pw_str = core::str::from_utf8(&pw).expect("password is ASCII");
         let rc = vault.begin(pw_str, kf, &mut self.rng);
-        if rc != VaultError::Ok {
+        if rc != VaultError::None {
             crypto::wipe(&mut pw);
             self.publish_result(req.id, Job::Provision, JobResult::Error);
             return;
@@ -392,7 +401,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         self.slot.password.extend_from_slice(&pw);
         self.slot
             .session_token
-            .extend_from_slice(hex_encode(&self.token).as_bytes());
+            .extend_from_slice(hex::encode(&self.token).as_bytes());
         crypto::wipe(&mut pw);
 
         self.publish_result(req.id, Job::Provision, JobResult::Ok);
@@ -407,7 +416,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         let pw_str = core::str::from_utf8(&req.password).unwrap_or("");
         let kf = keyfile_opt(&req.key_file);
         let rc = vault.begin(pw_str, kf, &mut self.rng);
-        if rc == VaultError::Ok {
+        if rc == VaultError::None {
             self.fail_count = 0;
             self.lockout_until_ms = 0;
             self.unlocked = true;
@@ -415,7 +424,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
             self.refresh_token();
             self.slot
                 .session_token
-                .extend_from_slice(hex_encode(&self.token).as_bytes());
+                .extend_from_slice(hex::encode(&self.token).as_bytes());
             self.publish_result(req.id, Job::Unlock, JobResult::Ok);
             return;
         }
@@ -443,7 +452,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
             self.publish_result(req.id, Job::Reset, JobResult::Refused);
             return;
         }
-        if vault.reset() != VaultError::Ok {
+        if vault.reset() != VaultError::None {
             self.publish_result(req.id, Job::Reset, JobResult::Error);
             return;
         }
@@ -470,7 +479,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         let old_str = core::str::from_utf8(&req.old_password).unwrap_or("");
         let cur = keyfile_opt(&req.key_file);
         let vb = vault.begin(old_str, cur, &mut self.rng);
-        if vb != VaultError::Ok {
+        if vb != VaultError::None {
             let res = if vb == VaultError::WrongPassword {
                 JobResult::WrongPassword
             } else {
@@ -493,7 +502,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         };
         let rc = vault.rekey(new_str, target, &mut self.rng);
         match rc {
-            VaultError::Ok => {
+            VaultError::None => {
                 self.publish_result(req.id, Job::Rekey, JobResult::Ok);
             }
             VaultError::BootStrap => {
@@ -509,7 +518,6 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         self.slot.id = id;
         self.slot.kind = kind;
         self.slot.result = result;
-        self.slot.in_flight = false;
         self.busy = false;
     }
 
@@ -561,11 +569,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
             return 0;
         }
         let left = self.lockout_until_ms.wrapping_sub(self.clock.now_ms()) as i32;
-        if left > 0 {
-            left as u32
-        } else {
-            0
-        }
+        if left > 0 { left as u32 } else { 0 }
     }
 
     // ── Session ──────────────────────────────────────────────────────────────
@@ -598,7 +602,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         if !self.unlocked || self.token_all_zero() {
             return None;
         }
-        Some(hex_encode(&self.token))
+        Some(hex::encode(&self.token))
     }
 
     /// Validates `X-PM-Session`. Constant-time compare: an early exit would
@@ -609,16 +613,8 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         }
         let bytes = token_hex.as_bytes();
         let mut given = [0u8; SESSION_TOKEN_LEN];
-        for i in 0..SESSION_TOKEN_LEN {
-            let hi = match hex_nibble(bytes[i * 2]) {
-                Some(v) => v,
-                None => return false,
-            };
-            let lo = match hex_nibble(bytes[i * 2 + 1]) {
-                Some(v) => v,
-                None => return false,
-            };
-            given[i] = (hi << 4) | lo;
+        if !hex::decode_into(bytes, &mut given) {
+            return false;
         }
         let ok = crypto::ct_equal(&self.token, &given);
         crypto::wipe(&mut given);
@@ -667,83 +663,15 @@ fn keyfile_opt(key_file: &[u8]) -> Option<&[u8]> {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::VAULT_PARTITION_BYTES;
     use crate::rand::CycleSource;
+    use crate::testutil::{MemStorage, vault};
 
-    const MAC: [u8; 6] = [0x44, 0x21, 0x5b, 0x5f, 0x0c, 0x7c];
     const SALT_BYTES: &[u8] = b"deterministic-salt-material-0123456789";
     const PW: &str = "correct horse battery staple";
     const PW2: &str = "another correct battery staple";
-
-    struct MemStorage {
-        data: Vec<u8>,
-    }
-
-    impl MemStorage {
-        fn new(size: usize) -> Self {
-            Self {
-                data: vec![0xFF; size],
-            }
-        }
-    }
-
-    impl Storage for MemStorage {
-        fn size(&self) -> usize {
-            self.data.len()
-        }
-        fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), VaultError> {
-            let end = offset.checked_add(buf.len()).ok_or(VaultError::Io)?;
-            if end > self.data.len() {
-                return Err(VaultError::Io);
-            }
-            buf.copy_from_slice(&self.data[offset..end]);
-            Ok(())
-        }
-        fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), VaultError> {
-            let end = offset.checked_add(buf.len()).ok_or(VaultError::Io)?;
-            if end > self.data.len() {
-                return Err(VaultError::Io);
-            }
-            for (dst, &src) in self.data[offset..end].iter_mut().zip(buf) {
-                *dst &= src;
-            }
-            Ok(())
-        }
-        fn erase(&mut self, offset: usize, len: usize) -> Result<(), VaultError> {
-            let end = offset.checked_add(len).ok_or(VaultError::Io)?;
-            if end > self.data.len() {
-                return Err(VaultError::Io);
-            }
-            self.data[offset..end].fill(0xFF);
-            Ok(())
-        }
-    }
-
-    fn vault() -> Vault<MemStorage> {
-        Vault::new(MemStorage::new(VAULT_PARTITION_BYTES), MAC)
-    }
 
     fn auth(clock: ManualClock) -> Auth<CycleSource<'static>, ManualClock> {
         Auth::new(CycleSource::new(SALT_BYTES), clock)

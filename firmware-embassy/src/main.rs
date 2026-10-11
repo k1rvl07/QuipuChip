@@ -1,10 +1,9 @@
 //! PassManager firmware — pure-Rust (esp-hal + embassy) boot path.
 //!
-//! Phase 2 skeleton: bring up the heap (internal DRAM + PSRAM), mount the
-//! `vault` partition through `esp-storage`, restore the vault's provisioned
-//! state, then start the USB-NCM / embassy-net / picoserve stack. The HTTP and
-//! auth surfaces are added in later phases; for now the device serves the
-//! Phase 0 probe routes.
+//! Brings up the heap (internal DRAM + PSRAM), mounts the `vault` partition
+//! through `esp-storage`, restores the vault's provisioned state, then starts
+//! the USB-NCM / embassy-net / picoserve stack that serves the static SPA and
+//! the auth + entries HTTP API.
 
 #![no_std]
 #![no_main]
@@ -47,7 +46,7 @@ mod selftest;
 mod storage;
 mod web;
 
-use pm_core::vault::{Storage as _, Vault};
+use pm_core::vault::Vault;
 use storage::VaultStorage;
 
 use authsvc::WorkerAuth;
@@ -108,7 +107,7 @@ async fn main(spawner: Spawner) -> ! {
             log::info!("vault: base={:#x} size={}", base, size);
             log::info!(
                 "vault: state={}({}) provisioned={} entries={}",
-                snap.state.to_str(),
+                snap.state.as_str(),
                 snap.state as u32,
                 vault.provisioned(),
                 vault.count()

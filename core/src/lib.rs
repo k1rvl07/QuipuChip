@@ -1,11 +1,13 @@
 //! Portable core for the PassManager firmware.
 //!
 //! Everything here must build and be testable on the host, without any ESP-IDF
-//! or hardware dependency. Board-specific code lives in the `pm-firmware` crate.
+//! or hardware dependency. Board-specific code lives in the `firmware-embassy`
+//! crate.
 //!
-//! The formats implemented here are byte-compatible with the C++ reference in
-//! `src/` and `include/`: the on-flash vault (PMV1) and the export container
-//! (PMX1), plus the crypto and password/totp primitives.
+//! The formats implemented here are byte-compatible with the C++ reference that
+//! preceded this port: the on-flash vault (PMV1) and the export container
+//! (PMX1), plus the crypto and password/totp primitives. That C++ implementation
+//! was removed from the tree and is recoverable only from git history.
 //!
 //! The crate is `no_std` on device and needs only `alloc`; host builds compile
 //! it with `std` (see `cfg_attr` below) so the test harness keeps working.
@@ -15,16 +17,22 @@
 extern crate alloc;
 
 pub mod auth;
+pub mod base64;
 pub mod config;
 pub mod crypto;
 pub mod device;
 pub mod entry;
 pub mod export;
+pub mod hex;
 pub mod password;
 pub mod rand;
 pub mod totp;
+pub mod types;
 pub mod vault;
 pub mod wordlist;
+
+#[cfg(test)]
+pub mod testutil;
 
 /// Returns the current firmware version string reported over the API.
 pub const fn version() -> &'static str {
@@ -40,7 +48,7 @@ mod tests {
 
     #[test]
     fn wordlist_shape_and_terminators() {
-        use crate::wordlist::{word, WORDS, WORD_BYTES, WORD_COUNT, WORD_STRIDE};
+        use crate::wordlist::{WORD_BYTES, WORD_COUNT, WORD_STRIDE, WORDS, word};
         assert_eq!(WORD_COUNT, 4096);
         assert_eq!(WORD_BYTES, 5);
         assert_eq!(WORD_STRIDE, 6);

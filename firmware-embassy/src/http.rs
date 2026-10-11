@@ -22,8 +22,9 @@ use picoserve::request::{Path, Request, RequestBodyConnection, RequestParts};
 use picoserve::response::{Connection, Content, Response, ResponseWriter, StatusCode};
 use picoserve::routing::PathRouterService;
 use pm_core::auth::{Job, JobId, JobResult, KeyfileAction, NO_JOB, SESSION_TOKEN_HEX_LEN};
-use pm_core::entry::{Entry, Field, VaultError};
+use pm_core::entry::{Entry, Field};
 use pm_core::export;
+use pm_core::types::VaultError;
 use serde_json::{Value, json};
 
 use crate::authsvc;
@@ -259,79 +260,55 @@ async fn route<R: Read>(
 ) -> Result<Outcome, HttpError> {
     match path {
         "/api/health" => {
-            if method == "GET" {
-                return Ok(health());
-            }
-            return Err(method_not_allowed());
+            method_is(method, "GET")?;
+            return Ok(health());
         }
         "/api/auth/state" => {
-            if method == "GET" {
-                return Ok(auth_state());
-            }
-            return Err(method_not_allowed());
+            method_is(method, "GET")?;
+            return Ok(auth_state());
         }
         "/api/auth/provision" => {
-            if method == "POST" {
-                return provision(parts, body).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "POST")?;
+            return provision(parts, body).await;
         }
         "/api/auth/unlock" => {
-            if method == "POST" {
-                return unlock(parts, body).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "POST")?;
+            return unlock(parts, body).await;
         }
         "/api/auth/lock" => {
-            if method == "POST" {
-                return lock(parts).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "POST")?;
+            return lock(parts).await;
         }
         "/api/auth/session" => {
-            if method == "GET" {
-                return session(parts);
-            }
-            return Err(method_not_allowed());
+            method_is(method, "GET")?;
+            return session(parts);
         }
         "/api/auth/reset" => {
-            if method == "POST" {
-                return reset(parts, body).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "POST")?;
+            return reset(parts, body).await;
         }
         "/api/auth/rekey" => {
-            if method == "POST" {
-                return rekey(parts, body).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "POST")?;
+            return rekey(parts, body).await;
         }
         "/api/auth/password" => {
-            if method == "GET" {
-                return password(parts).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "GET")?;
+            return password(parts).await;
         }
         "/api/export" => {
-            if method == "GET" {
-                return export(parts).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "GET")?;
+            return export(parts).await;
         }
         "/api/import" => {
-            if method == "POST" {
-                return import(parts, body).await;
-            }
-            return Err(method_not_allowed());
+            method_is(method, "POST")?;
+            return import(parts, body).await;
         }
         "/api/entries" => {
-            if method == "GET" {
-                return entries_list(parts).await;
-            }
-            if method == "POST" {
-                return entries_write(path, parts, body).await;
-            }
-            return Err(method_not_allowed());
+            return match method {
+                "GET" => entries_list(parts).await,
+                "POST" => entries_write(path, parts, body).await,
+                _ => Err(method_not_allowed()),
+            };
         }
         _ => {}
     }
@@ -360,6 +337,14 @@ async fn route<R: Read>(
         return Err(method_not_allowed());
     }
     static_asset(path)
+}
+
+fn method_is(method: &str, expected: &str) -> Result<(), HttpError> {
+    if method == expected {
+        Ok(())
+    } else {
+        Err(method_not_allowed())
+    }
 }
 
 fn static_asset(path: &str) -> Result<Outcome, HttpError> {
@@ -580,55 +565,11 @@ fn keyfile_field(doc: &Value, key: &str) -> Result<Vec<u8>, HttpError> {
     if (b64.len() / 4) * 3 > pm_core::config::KEYFILE_MAX_BYTES {
         return Err(bad_request("keyfile_too_large"));
     }
-    match base64_decode(b64) {
+    match pm_core::base64::decode(b64) {
         Some(bytes) if bytes.is_empty() => Ok(Vec::new()),
         Some(bytes) => Ok(bytes),
         None => Err(bad_request("keyfile_invalid_base64")),
     }
-}
-
-fn b64_value(c: u8) -> Option<u8> {
-    match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-/// Strict RFC 4648 base64: standard alphabet, padding only in the last group.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if b.is_empty() || !b.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(b.len() / 4 * 3);
-    for chunk in b.chunks_exact(4) {
-        let a = b64_value(chunk[0])?;
-        let b2 = b64_value(chunk[1])?;
-        let c_pad = chunk[2] == b'=';
-        let d_pad = chunk[3] == b'=';
-        if c_pad && !d_pad {
-            return None;
-        }
-        let c = if c_pad { 0 } else { b64_value(chunk[2])? };
-        let d = if d_pad { 0 } else { b64_value(chunk[3])? };
-        out.push((a << 2) | (b2 >> 4));
-        if c_pad {
-            continue;
-        }
-        out.push(((b2 & 0x0F) << 4) | (c >> 2));
-        if d_pad {
-            continue;
-        }
-        out.push(((c & 0x03) << 6) | d);
-    }
-    if out.len() > pm_core::config::KEYFILE_MAX_BYTES {
-        return None;
-    }
-    Some(out)
 }
 
 fn parse_job_id(path: &str) -> Option<JobId> {
@@ -638,15 +579,6 @@ fn parse_job_id(path: &str) -> Option<JobId> {
         return None;
     }
     u64::from_str_radix(seg, 16).ok().filter(|&v| v != NO_JOB)
-}
-
-fn job_kind_name(job: Job) -> &'static str {
-    match job {
-        Job::Provision => "provision",
-        Job::Unlock => "unlock",
-        Job::Reset => "reset",
-        Job::Rekey => "rekey",
-    }
 }
 
 fn job_error_outcome(result: JobResult) -> Outcome {
@@ -748,16 +680,7 @@ fn add_error(e: VaultError) -> HttpError {
 /// `Entry::set` would truncate silently, which is exactly the silent corruption
 /// the reference refuses with `400 field_too_long_or_not_a_string`.
 fn fill_entry(doc: &Value, e: &mut Entry) -> Result<(), HttpError> {
-    const FIELDS: &[(&str, Field)] = &[
-        ("title", Field::Title),
-        ("login", Field::Login),
-        ("password", Field::Password),
-        ("url", Field::Url),
-        ("note", Field::Note),
-        ("tags", Field::Tags),
-        ("totp", Field::Totp),
-    ];
-    for (key, field) in FIELDS {
+    for (key, field) in pm_core::entry::FIELD_KEYS {
         match doc.get(*key) {
             None | Some(Value::Null) => {}
             Some(Value::String(s)) => {
@@ -772,7 +695,7 @@ fn fill_entry(doc: &Value, e: &mut Entry) -> Result<(), HttpError> {
     if !e.get(Field::Totp).is_empty() {
         let ok = core::str::from_utf8(e.get(Field::Totp))
             .ok()
-            .is_some_and(pm_core::totp::valid_secret);
+            .is_some_and(pm_core::totp::is_valid_secret);
         if !ok {
             return Err(bad_request("totp_secret_invalid"));
         }
@@ -910,7 +833,7 @@ async fn job_poll(path: &str) -> Result<Outcome, HttpError> {
     let mut body = json!({
         "ok": true,
         "result": "ok",
-        "job": job_kind_name(view.kind),
+        "job": view.kind.as_str(),
     });
     if view.kind == Job::Provision {
         match core::str::from_utf8(&view.password) {
@@ -1063,7 +986,7 @@ async fn entries_list(parts: RequestParts<'_>) -> Result<Outcome, HttpError> {
     let entries = match authsvc::entries_list().await {
         Ok(v) => v,
         Err(err) => {
-            log::error!("http: vault load failed: {}", err.to_str());
+            log::error!("http: vault load failed: {}", err.as_str());
             return Err(internal("vault_load_failed"));
         }
     };
@@ -1122,7 +1045,7 @@ async fn entries_write<R: Read>(
         }
         Err(VaultError::NotFound) => Err(not_found("entry_not_found")),
         Err(e) => {
-            log::error!("http: vault add failed: {}", e.to_str());
+            log::error!("http: vault add failed: {}", e.as_str());
             Err(add_error(e))
         }
     }
@@ -1143,7 +1066,7 @@ async fn entry_detail(id: u32) -> Result<Outcome, HttpError> {
         Ok(e) => e,
         Err(VaultError::NotFound) => return Err(not_found("entry_not_found")),
         Err(err) => {
-            log::error!("http: vault get failed: {}", err.to_str());
+            log::error!("http: vault get failed: {}", err.as_str());
             return Err(internal("vault_get_failed"));
         }
     };
@@ -1161,7 +1084,7 @@ async fn entry_secret(id: u32) -> Result<Outcome, HttpError> {
         Ok(e) => e,
         Err(VaultError::NotFound) => return Err(not_found("entry_not_found")),
         Err(err) => {
-            log::error!("http: vault get failed: {}", err.to_str());
+            log::error!("http: vault get failed: {}", err.as_str());
             return Err(internal("vault_get_failed"));
         }
     };
@@ -1189,7 +1112,7 @@ async fn entry_totp(id: u32, parts: RequestParts<'_>) -> Result<Outcome, HttpErr
         Ok(e) => e,
         Err(VaultError::NotFound) => return Err(not_found("entry_not_found")),
         Err(err) => {
-            log::error!("http: vault get failed: {}", err.to_str());
+            log::error!("http: vault get failed: {}", err.as_str());
             return Err(internal("vault_get_failed"));
         }
     };
@@ -1203,9 +1126,9 @@ async fn entry_totp(id: u32, parts: RequestParts<'_>) -> Result<Outcome, HttpErr
             return Err(internal("totp_secret_invalid"));
         }
     };
-    // The secret passed `valid_secret` at write time; a failure here is
+    // The secret passed `is_valid_secret` at write time; a failure here is
     // corruption, not user error.
-    let code = match pm_core::totp::code(secret, u64::from(when)) {
+    let code = match pm_core::totp::compute(secret, u64::from(when)) {
         Ok(c) => c,
         Err(_) => {
             log::error!("http: entry {id} totp secret unusable");
@@ -1254,7 +1177,7 @@ async fn entries_delete<R: Read>(
         }
         Err(VaultError::NotFound) => Err(not_found("entry_not_found")),
         Err(err) => {
-            log::error!("http: vault remove failed: {}", err.to_str());
+            log::error!("http: vault remove failed: {}", err.as_str());
             Err(internal("vault_remove_failed"))
         }
     }
@@ -1265,7 +1188,7 @@ async fn export(parts: RequestParts<'_>) -> Result<Outcome, HttpError> {
     let entries = match authsvc::entries_list().await {
         Ok(v) => v,
         Err(err) => {
-            log::error!("http: vault load failed: {}", err.to_str());
+            log::error!("http: vault load failed: {}", err.as_str());
             return Err(internal("vault_load_failed"));
         }
     };

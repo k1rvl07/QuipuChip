@@ -1,4 +1,4 @@
-//! Device factor, ported from `src/device_factor.cpp`.
+//! Device factor, ported from the removed C++ reference.
 //!
 //! The factor is `HMAC-SHA256(mac6, "pm-vault-device" || salt_dev)`: a 32-byte
 //! key derived from the factory MAC and the per-vault salt. The MAC is read at

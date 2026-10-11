@@ -1,12 +1,12 @@
-//! PMV1 on-flash vault, ported from `src/vault.cpp`.
+//! PMV1 on-flash vault, ported from the removed C++ reference.
 //!
 //! The container lives in the `vault` partition and is accessed as a flat
 //! ciphertext blob, without a filesystem. Layout, record format, AAD rules and
 //! the two-slot header are byte-compatible with the C++ reference so a vault
 //! written by either implementation opens in the other.
 //!
-//! Hardware access is abstracted behind [`Storage`]; `pm-firmware` implements it
-//! on top of `esp_partition_*`, while tests drive an in-memory flash that
+//! Hardware access is abstracted behind [`Storage`]; `firmware-embassy`
+//! implements it on top of `esp-storage`, while tests drive an in-memory flash that
 //! reproduces the only property that matters for correctness: writes may only
 //! clear bits (`1 -> 0`), and erase sets a sector back to `0xFF`.
 //!
@@ -19,10 +19,11 @@ use alloc::{vec, vec::Vec};
 use crate::config::*;
 use crate::crypto;
 use crate::device;
-use crate::entry::{Entry, Snapshot, State, Stats, VaultError};
+use crate::entry::Entry;
 use crate::rand::RandomSource;
+use crate::types::{Snapshot, State, Stats, VaultError};
 
-// ── Header field offsets (from src/vault.cpp, anonymous namespace) ────────────
+// ── Header field offsets (from the C++ reference, anonymous namespace) ────────
 
 const HDR_MAGIC: usize = 0x00;
 const HDR_VERSION: usize = 0x04;
@@ -348,8 +349,8 @@ impl<S: Storage> Vault<S> {
             return SlotState::Torn;
         }
         let iters = get32(&out[HDR_ITERS..]);
-        let gen = get32(&out[HDR_GENERATION..]);
-        if iters == 0 || iters > 10_000_000 || gen == 0 {
+        let generation = get32(&out[HDR_GENERATION..]);
+        if iters == 0 || iters > 10_000_000 || generation == 0 {
             return SlotState::Invalid;
         }
 
@@ -381,7 +382,7 @@ impl<S: Storage> Vault<S> {
             }
         }
         let aad = build_aad(out);
-        let nonce = nonce_for(gen, 0);
+        let nonce = nonce_for(generation, 0);
         let mut ct = [0u8; SENTINEL.len()];
         let tag = match crypto::aes_gcm_encrypt(&trial, &nonce, &aad, &mut ct) {
             Ok(t) => t,
@@ -436,7 +437,7 @@ impl<S: Storage> Vault<S> {
         let res = self.storage.write(off, &rec);
         crypto::wipe(&mut rec);
         match res {
-            Ok(()) => VaultError::Ok,
+            Ok(()) => VaultError::None,
             Err(_) => VaultError::Io,
         }
     }
@@ -562,7 +563,7 @@ impl<S: Storage> Vault<S> {
             }
             off += total;
         }
-        VaultError::Ok
+        VaultError::None
     }
 
     fn tail_is_dirty(&self) -> bool {
@@ -651,7 +652,7 @@ impl<S: Storage> Vault<S> {
             }
             let wr = self.write_record_at(cursor, it.id, &buf);
             crypto::wipe(&mut buf);
-            if wr != VaultError::Ok {
+            if wr != VaultError::None {
                 ok = false;
                 break;
             }
@@ -691,7 +692,7 @@ impl<S: Storage> Vault<S> {
             );
             return VaultError::Io;
         }
-        VaultError::Ok
+        VaultError::None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -818,7 +819,7 @@ impl<S: Storage> Vault<S> {
             self.ready = true;
             self.provisioned = true;
             self.publish_snapshot();
-            return VaultError::Ok;
+            return VaultError::None;
         }
 
         // Existing vault: inspect both slots independently.
@@ -899,7 +900,7 @@ impl<S: Storage> Vault<S> {
         }
 
         let sc = self.scan_log();
-        if sc != VaultError::Ok {
+        if sc != VaultError::None {
             crypto::wipe(&mut self.key);
             self.index.clear();
             self.live_payload = 0;
@@ -917,7 +918,7 @@ impl<S: Storage> Vault<S> {
 
         if self.tail_is_dirty() {
             let rc = self.compact();
-            if rc != VaultError::Ok {
+            if rc != VaultError::None {
                 crypto::wipe(&mut self.key);
                 self.index.clear();
                 self.live_payload = 0;
@@ -928,7 +929,7 @@ impl<S: Storage> Vault<S> {
         self.ready = true;
         self.provisioned = true;
         self.publish_snapshot();
-        VaultError::Ok
+        VaultError::None
     }
 
     // ── Entry operations ─────────────────────────────────────────────────────
@@ -985,7 +986,7 @@ impl<S: Storage> Vault<S> {
         }
         if self.used_end - self.data_start + REC_FIXED + plen > VAULT_COMPACT_TRIGGER_BYTES {
             let c = self.compact();
-            if c != VaultError::Ok {
+            if c != VaultError::None {
                 crypto::wipe(&mut buf);
                 return Err(if c == VaultError::NoSpace {
                     VaultError::Budget
@@ -1002,7 +1003,7 @@ impl<S: Storage> Vault<S> {
         let off = self.used_end;
         let wr = self.write_record_at(off, id, &buf[..plen]);
         crypto::wipe(&mut buf);
-        if wr != VaultError::Ok {
+        if wr != VaultError::None {
             return Err(wr);
         }
         self.used_end = off + REC_FIXED + plen;
@@ -1029,7 +1030,7 @@ impl<S: Storage> Vault<S> {
         }
         if self.used_end - self.data_start + REC_FIXED + 1 > VAULT_REGION_BYTES {
             let c = self.compact();
-            if c != VaultError::Ok {
+            if c != VaultError::None {
                 return c;
             }
             if self.used_end - self.data_start + REC_FIXED + 1 > VAULT_REGION_BYTES {
@@ -1038,7 +1039,7 @@ impl<S: Storage> Vault<S> {
         }
         let off = self.used_end;
         let wr = self.write_record_at(off, id | TOMBSTONE_BIT, &[]);
-        if wr != VaultError::Ok {
+        if wr != VaultError::None {
             return wr;
         }
         self.used_end = off + REC_FIXED + 1;
@@ -1049,7 +1050,7 @@ impl<S: Storage> Vault<S> {
             return VaultError::Io;
         }
         self.publish_snapshot();
-        VaultError::Ok
+        VaultError::None
     }
 
     // ── Destructive operations ───────────────────────────────────────────────
@@ -1104,7 +1105,7 @@ impl<S: Storage> Vault<S> {
             return VaultError::Io;
         }
         self.publish_snapshot();
-        VaultError::Ok
+        VaultError::None
     }
 
     /// Changes the master password of an open vault. Mirrors `vault::rekey`.
@@ -1211,7 +1212,7 @@ impl<S: Storage> Vault<S> {
             }
             let wr = self.write_record_at(cursor, it.id, &buf);
             crypto::wipe(&mut buf);
-            if wr != VaultError::Ok {
+            if wr != VaultError::None {
                 ok = false;
                 break;
             }
@@ -1241,7 +1242,7 @@ impl<S: Storage> Vault<S> {
             .storage
             .erase(region_start(saved.old_region), VAULT_REGION_BYTES);
         self.publish_snapshot();
-        VaultError::Ok
+        VaultError::None
     }
 
     fn rekey_restore(&mut self, saved: &RekeySaved, gen_bumped: bool) {
@@ -1289,7 +1290,7 @@ impl<S: Storage> Vault<S> {
         self.ready = false;
         self.provisioned = false;
         self.publish_snapshot();
-        VaultError::Ok
+        VaultError::None
     }
 }
 
@@ -1323,11 +1324,7 @@ fn region_start(region: usize) -> usize {
 }
 
 fn header_slot_offset(seq: u32) -> usize {
-    if seq & 1 == 1 {
-        HDR_SLOT1
-    } else {
-        HDR_SLOT0
-    }
+    if seq & 1 == 1 { HDR_SLOT1 } else { HDR_SLOT0 }
 }
 
 fn put32(p: &mut [u8], v: u32) {
@@ -1380,16 +1377,16 @@ fn nonce_for(generation: u32, offset: usize) -> [u8; GCM_IV_LEN] {
 /// password string, so pre-key-file vaults keep opening.
 fn build_material(password: &str, key_file: Option<&[u8]>) -> Option<Vec<u8>> {
     let pw = password.as_bytes();
-    if pw.len() >= MAX_PASS_CHARS || pw.len() + 32 > MAX_PASS_CHARS + 32 {
+    if pw.len() >= MAX_PASS_CHARS {
         return None;
     }
     let mut v = Vec::with_capacity(pw.len() + 32);
     v.extend_from_slice(pw);
-    if let Some(kf) = key_file {
-        if !kf.is_empty() {
-            let h = crypto::sha256(kf);
-            v.extend_from_slice(&h);
-        }
+    if let Some(kf) = key_file
+        && !kf.is_empty()
+    {
+        let h = crypto::sha256(kf);
+        v.extend_from_slice(&h);
     }
     Some(v)
 }
@@ -1417,59 +1414,11 @@ mod tests {
     use super::*;
     use crate::entry::Field;
     use crate::rand::CycleSource;
+    use crate::testutil::vault;
 
-    const MAC: [u8; 6] = [0x44, 0x21, 0x5b, 0x5f, 0x0c, 0x7c];
     const SALT_BYTES: &[u8] = b"deterministic-salt-material-0123456789";
     const PW: &str = "correct horse battery staple";
     const PW2: &str = "another correct battery staple";
-
-    struct MemStorage {
-        data: Vec<u8>,
-    }
-
-    impl MemStorage {
-        fn new(size: usize) -> Self {
-            Self {
-                data: vec![0xFF; size],
-            }
-        }
-    }
-
-    impl Storage for MemStorage {
-        fn size(&self) -> usize {
-            self.data.len()
-        }
-        fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), VaultError> {
-            let end = offset.checked_add(buf.len()).ok_or(VaultError::Io)?;
-            if end > self.data.len() {
-                return Err(VaultError::Io);
-            }
-            buf.copy_from_slice(&self.data[offset..end]);
-            Ok(())
-        }
-        fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), VaultError> {
-            let end = offset.checked_add(buf.len()).ok_or(VaultError::Io)?;
-            if end > self.data.len() {
-                return Err(VaultError::Io);
-            }
-            for (dst, &src) in self.data[offset..end].iter_mut().zip(buf) {
-                *dst &= src; // flash can only clear bits
-            }
-            Ok(())
-        }
-        fn erase(&mut self, offset: usize, len: usize) -> Result<(), VaultError> {
-            let end = offset.checked_add(len).ok_or(VaultError::Io)?;
-            if end > self.data.len() {
-                return Err(VaultError::Io);
-            }
-            self.data[offset..end].fill(0xFF);
-            Ok(())
-        }
-    }
-
-    fn vault() -> Vault<MemStorage> {
-        Vault::new(MemStorage::new(VAULT_PARTITION_BYTES), MAC)
-    }
 
     fn rng() -> CycleSource<'static> {
         CycleSource::new(SALT_BYTES)
@@ -1490,7 +1439,7 @@ mod tests {
         let mut v = vault();
         assert_eq!(v.snapshot().state, State::Unprovisioned);
         assert!(!v.provisioned());
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         assert!(v.provisioned());
         assert_eq!(v.snapshot().state, State::Unlocked);
 
@@ -1504,7 +1453,7 @@ mod tests {
         assert_eq!(v.count(), 0);
         assert_eq!(v.snapshot().state, State::Locked);
 
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         assert_eq!(v.count(), 1);
         let got = v.get(id).unwrap();
         assert_eq!(got.get(Field::Title), b"Mail");
@@ -1514,7 +1463,7 @@ mod tests {
     #[test]
     fn wrong_password_keeps_locked() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         v.close();
         assert_eq!(
             v.begin("definitely the wrong password", None, &mut rng()),
@@ -1528,16 +1477,16 @@ mod tests {
     #[test]
     fn remove_drops_entry_after_reopen() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         let a = v.add(&entry("A", "pw-a")).unwrap();
         let b = v.add(&entry("B", "pw-b")).unwrap();
-        assert_eq!(v.remove(a), VaultError::Ok);
+        assert_eq!(v.remove(a), VaultError::None);
         assert_eq!(v.count(), 1);
         assert_eq!(v.get(a), Err(VaultError::NotFound));
         assert_eq!(v.get(b).unwrap().get(Field::Password), b"pw-b");
 
         v.close();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         assert_eq!(v.count(), 1);
         assert_eq!(v.get(a), Err(VaultError::NotFound));
     }
@@ -1545,7 +1494,7 @@ mod tests {
     #[test]
     fn update_reuses_id() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         let id = v.add(&entry("A", "old")).unwrap();
         let mut e = entry("A", "new");
         e.id = id;
@@ -1557,13 +1506,13 @@ mod tests {
     #[test]
     fn rekey_changes_password() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         v.add(&entry("Mail", "secret")).unwrap();
-        assert_eq!(v.rekey(PW2, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.rekey(PW2, None, &mut rng()), VaultError::None);
         v.close();
 
         assert_eq!(v.begin(PW, None, &mut rng()), VaultError::WrongPassword);
-        assert_eq!(v.begin(PW2, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW2, None, &mut rng()), VaultError::None);
         assert_eq!(v.count(), 1);
         let entries = v.load(10).unwrap();
         assert_eq!(entries[0].get(Field::Password), b"secret");
@@ -1572,7 +1521,7 @@ mod tests {
     #[test]
     fn compaction_preserves_entries() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
 
         let note = vec![b'x'; 400];
         let mut ids = Vec::new();
@@ -1588,7 +1537,7 @@ mod tests {
         assert_eq!(v.count(), 300);
 
         v.close();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         assert_eq!(v.count(), 300);
         for &id in &ids {
             assert!(v.get(id).is_ok());
@@ -1600,7 +1549,7 @@ mod tests {
     fn key_file_required_and_enforced() {
         let mut v = vault();
         let kf = b"super-secret-key-file";
-        assert_eq!(v.begin(PW, Some(kf), &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, Some(kf), &mut rng()), VaultError::None);
         v.add(&entry("Mail", "secret")).unwrap();
         assert!(v.key_file_required());
         v.close();
@@ -1610,14 +1559,14 @@ mod tests {
             v.begin(PW, Some(b"wrong-key-file"), &mut rng()),
             VaultError::WrongPassword
         );
-        assert_eq!(v.begin(PW, Some(kf), &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, Some(kf), &mut rng()), VaultError::None);
         assert_eq!(v.count(), 1);
     }
 
     #[test]
     fn tampered_newest_header_is_rejected() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         v.add(&entry("Mail", "secret")).unwrap();
         v.close();
 
@@ -1636,14 +1585,14 @@ mod tests {
     #[test]
     fn torn_tail_triggers_rebuild() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         // No records yet: used_end is the region start. Drop a dirty byte just
         // past it; begin() must notice and rebuild into the clean region.
         let dirty_at = region_start(0);
         v.storage_mut().write(dirty_at, &[0x00]).unwrap();
         v.close();
 
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         assert_eq!(v.stats().generation, 2);
         assert!(v.stats().compacted_once);
     }
@@ -1651,17 +1600,17 @@ mod tests {
     #[test]
     fn clear_reprovisions_and_reset_destroys() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         v.add(&entry("Mail", "secret")).unwrap();
 
-        assert_eq!(v.clear(PW2, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.clear(PW2, None, &mut rng()), VaultError::None);
         assert!(v.initialized());
         assert_eq!(v.count(), 0);
         v.close();
-        assert_eq!(v.begin(PW2, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW2, None, &mut rng()), VaultError::None);
         assert_eq!(v.count(), 0);
 
-        assert_eq!(v.reset(), VaultError::Ok);
+        assert_eq!(v.reset(), VaultError::None);
         assert_eq!(v.snapshot().state, State::Unprovisioned);
         assert!(!v.provisioned());
         assert!(!v.initialized());
@@ -1670,7 +1619,7 @@ mod tests {
     #[test]
     fn load_honors_max_count() {
         let mut v = vault();
-        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Ok);
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
         for i in 0..5 {
             v.add(&entry("x", &format!("pw{i}"))).unwrap();
         }

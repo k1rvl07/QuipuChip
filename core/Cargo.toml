@@ -1,8 +1,11 @@
 [package]
 name = "pm-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Portable, host-testable core: PMV1 vault format, crypto, entries, PMX1 export"
+
+[lints]
+workspace = true
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }

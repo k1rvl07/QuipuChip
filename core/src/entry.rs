@@ -1,9 +1,9 @@
-//! Vault entry and the error/state types shared by the PMV1 implementation.
+//! Vault entry: the on-disk record and its field model.
 //!
-//! Ported from `include/vault.h`. The on-disk representation is a row of
+//! Ported from the removed C++ reference. The on-disk representation is a row of
 //! NUL-terminated fields written back-to-back with a fixed order:
 //! `title, login, password, url, note, tags, totp`. The fixed capacities below
-//! are part of the format: a `static_assert` in the C++ header pins the payload
+//! are part of the format: a `static_assert` in the C++ reference pins the payload
 //! at 1088 bytes (`sizeof(Entry) - sizeof(id)`), and `config::MAX_ENTRY_LEN`
 //! (1280) bounds it.
 //!
@@ -195,15 +195,29 @@ impl core::fmt::Debug for Entry {
     }
 }
 
-const FIELD_ORDER: [Field; ENTRY_FIELDS] = [
-    Field::Title,
-    Field::Login,
-    Field::Password,
-    Field::Url,
-    Field::Note,
-    Field::Tags,
-    Field::Totp,
+/// `(JSON key, vault field)` in import/export order. Single source of truth for
+/// the seven entry fields; the binary order is derived from it below.
+pub const FIELD_KEYS: &[(&str, Field)] = &[
+    ("title", Field::Title),
+    ("login", Field::Login),
+    ("password", Field::Password),
+    ("url", Field::Url),
+    ("note", Field::Note),
+    ("tags", Field::Tags),
+    ("totp", Field::Totp),
 ];
+
+/// The seven fields in binary record order, derived from [`FIELD_KEYS`].
+pub const FIELD_ORDER: [Field; ENTRY_FIELDS] = {
+    let mut out = [Field::Title; ENTRY_FIELDS];
+    let mut i = 0;
+    while i < FIELD_KEYS.len() {
+        out[i] = FIELD_KEYS[i].1;
+        i += 1;
+    }
+    out
+};
+const _: () = assert!(FIELD_KEYS.len() == ENTRY_FIELDS);
 
 /// Length of a stored field string. If the slot has no NUL (should not happen),
 /// the last byte is treated as the terminator so callers stay in bounds.
@@ -211,90 +225,6 @@ fn field_strlen(raw: &[u8]) -> usize {
     match raw.iter().position(|&b| b == 0) {
         Some(p) => p,
         None => raw.len() - 1,
-    }
-}
-
-/// Mirrors `vault::VaultError`; discriminants are stable for logging.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VaultError {
-    Ok = 0,
-    NotFound = 1,
-    BootStrap = 2,
-    WrongPassword = 3,
-    Tampered = 4,
-    Budget = 5,
-    NoSpace = 6,
-    Serial = 7,
-    Crypto = 8,
-    Io = 9,
-    TooManyEntries = 10,
-    EntryTooLong = 11,
-}
-
-impl VaultError {
-    pub fn to_str(self) -> &'static str {
-        match self {
-            VaultError::Ok => "ok",
-            VaultError::NotFound => "partition not found",
-            VaultError::BootStrap => "not provisioned yet",
-            VaultError::WrongPassword => "wrong password",
-            VaultError::Tampered => "tampered",
-            VaultError::Budget => "live byte budget exceeded",
-            VaultError::NoSpace => "no space in vault",
-            VaultError::Serial => "serialization failed",
-            VaultError::Crypto => "crypto failed",
-            VaultError::Io => "flash io failed",
-            VaultError::TooManyEntries => "entry count limit",
-            VaultError::EntryTooLong => "entry too long",
-        }
-    }
-}
-
-/// Mirrors `vault::State`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Unprovisioned = 0,
-    Locked = 1,
-    Unlocked = 2,
-}
-
-impl State {
-    pub fn to_str(self) -> &'static str {
-        match self {
-            State::Unprovisioned => "unprovisioned",
-            State::Locked => "locked",
-            State::Unlocked => "unlocked",
-        }
-    }
-}
-
-/// Mirrors `vault::Stats`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Stats {
-    pub entry_count: u32,
-    pub live_bytes: usize,
-    pub used_bytes: usize,
-    pub generation: u32,
-    pub compacted_once: bool,
-}
-
-/// Mirrors `vault::Snapshot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Snapshot {
-    pub state: State,
-    pub entry_count: u32,
-    pub generation: u32,
-    pub live_bytes: usize,
-}
-
-impl Default for Snapshot {
-    fn default() -> Self {
-        Snapshot {
-            state: State::Unprovisioned,
-            entry_count: 0,
-            generation: 0,
-            live_bytes: 0,
-        }
     }
 }
 

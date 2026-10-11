@@ -1,4 +1,4 @@
-//! TOTP (RFC 6238), ported from `src/totp.cpp`.
+//! TOTP (RFC 6238), ported from the removed C++ reference.
 //!
 //! Algorithm is fixed: SHA-1, 6 digits, 30-second period. The secret is stored
 //! as an RFC 4648 base32 string (case-insensitive, optional `=` padding). Only
@@ -62,7 +62,7 @@ pub fn decode_base32(secret: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// Validates a secret string the same way the C++ reference does: length in
 /// `16..TOTP_SECRET_MAX` and at least 10 decoded bytes.
-pub fn valid_secret(secret: &str) -> bool {
+pub fn is_valid_secret(secret: &str) -> bool {
     let bytes = secret.as_bytes();
     if bytes.is_empty() || bytes.len() >= TOTP_SECRET_MAX || bytes.len() < 16 {
         return false;
@@ -72,7 +72,7 @@ pub fn valid_secret(secret: &str) -> bool {
 }
 
 /// Computes the 6-digit code for `time_sec`. Returns it zero-padded.
-pub fn code(secret: &str, time_sec: u64) -> Result<String, TotpError> {
+pub fn compute(secret: &str, time_sec: u64) -> Result<String, TotpError> {
     let mut key = [0u8; 64];
     let key_len = decode_base32(secret.as_bytes(), &mut key).ok_or(TotpError::BadSecret)?;
     if key_len < 10 {
@@ -114,19 +114,19 @@ mod tests {
             (2_000_000_000, "279037"),
         ];
         for (t, want) in vectors {
-            assert_eq!(code(secret, *t).unwrap(), *want, "t={}", t);
+            assert_eq!(compute(secret, *t).unwrap(), *want, "t={}", t);
         }
     }
 
     #[test]
     fn rejects_invalid_secrets() {
-        assert!(!valid_secret("abc"));
+        assert!(!is_valid_secret("abc"));
         // '1' is not in the base32 alphabet.
-        assert!(!valid_secret("ABCDEFGH1IJKLMNOP"));
-        assert!(!valid_secret(""));
-        assert!(code("too-short", 59).is_err());
+        assert!(!is_valid_secret("ABCDEFGH1IJKLMNOP"));
+        assert!(!is_valid_secret(""));
+        assert!(compute("too-short", 59).is_err());
         // Sanity: the RFC secret above must be valid.
-        assert!(valid_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"));
+        assert!(is_valid_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"));
     }
 
     #[test]

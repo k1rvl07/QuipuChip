@@ -12,7 +12,7 @@
 use alloc::string::String;
 
 use crate::config::{
-    MASTER_DIGITS, MASTER_PASSWORD_CHARS, MASTER_WORDS, MASTER_WORD_BYTES, MAX_DIGIT_ATTEMPTS,
+    MASTER_DIGITS, MASTER_PASSWORD_CHARS, MASTER_WORD_BYTES, MASTER_WORDS, MAX_DIGIT_ATTEMPTS,
 };
 use crate::rand::RandomSource;
 use crate::wordlist::word;
@@ -27,7 +27,7 @@ pub fn random_word_index(src: &mut impl RandomSource) -> usize {
 
 /// Uniform digit `0..=9`. After `MAX_DIGIT_ATTEMPTS` rejections, falls back to
 /// the last rejected byte (biased, but an explicit refusal to spin forever).
-pub fn random_digit(src: &mut impl RandomSource) -> u8 {
+pub fn next_digit(src: &mut impl RandomSource) -> u8 {
     let mut b = [0u8; 1];
     let mut last = 0u8;
     for _ in 0..MAX_DIGIT_ATTEMPTS {
@@ -57,7 +57,7 @@ pub fn generate_password(src: &mut impl RandomSource) -> [u8; MASTER_PASSWORD_CH
     out[n] = b'-';
     n += 1;
     for _ in 0..MASTER_DIGITS {
-        out[n] = b'0' + random_digit(src);
+        out[n] = b'0' + next_digit(src);
         n += 1;
     }
     debug_assert_eq!(n, MASTER_PASSWORD_CHARS);
@@ -97,13 +97,13 @@ mod tests {
     fn digit_rejects_high_bytes_and_caps_attempts() {
         // 0..=249 accepted as-is.
         let mut s = CycleSource::new(&[249]);
-        assert_eq!(random_digit(&mut s), 9);
+        assert_eq!(next_digit(&mut s), 9);
         let mut s = CycleSource::new(&[200]);
-        assert_eq!(random_digit(&mut s), 0);
+        assert_eq!(next_digit(&mut s), 0);
         // All-0xFF never passes; the cap turns it into the biased fallback
         // (255 % 10 == 5) instead of an infinite loop.
         let mut s = CycleSource::new(&[0xFF]);
-        assert_eq!(random_digit(&mut s), 5);
+        assert_eq!(next_digit(&mut s), 5);
     }
 
     #[test]

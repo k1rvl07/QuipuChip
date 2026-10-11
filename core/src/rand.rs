@@ -2,7 +2,7 @@
 //!
 //! `pm-core` never reaches for a global RNG: the board provides entropy
 //! (`esp_fill_random`), while tests inject a deterministic source. This mirrors
-//! the swappable `g_randSrc` in the C++ `auth.cpp`.
+//! the swappable `g_randSrc` in the C++ reference.
 
 /// A source of uniformly random bytes.
 pub trait RandomSource {

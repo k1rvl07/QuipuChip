@@ -1,4 +1,4 @@
-//! Cryptographic primitives, ported from `src/crypto.cpp` (mbedtls) to RustCrypto.
+//! Cryptographic primitives, ported from the C++ reference (mbedtls) to RustCrypto.
 //!
 //! The algorithms are standard, so a byte-identical port is expected:
 //! PBKDF2-HMAC-SHA256 (single output block, dkLen = 32), HMAC-SHA256,

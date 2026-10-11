@@ -1,5 +1,5 @@
-//! PMX1 export/import, ported from the `exportHandler` / `importHandler` in
-//! `src/http_server.cpp`.
+//! PMX1 export/import, ported from the `exportHandler` / `importHandler` of the
+//! removed C++ reference.
 //!
 //! Unlike the on-flash container (PMV1, binary), PMX1 is **JSON**:
 //!
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{EXPORT_MAGIC, EXPORT_VERSION, IMPORT_BATCH_ENTRIES};
-use crate::entry::{Entry, Field};
+use crate::entry::{Entry, FIELD_KEYS, Field};
 use crate::totp;
 
 /// `format` field of an export/import document (`config::kExportMagic`).
@@ -187,11 +187,10 @@ pub fn parse_import(value: &Value) -> Result<Vec<Entry>, ImportError> {
             }
         }
         if !e.get(Field::Totp).is_empty() {
-            let secret = core::str::from_utf8(e.get(Field::Totp))
+            core::str::from_utf8(e.get(Field::Totp))
                 .ok()
-                .filter(|s| totp::valid_secret(s))
+                .filter(|s| totp::is_valid_secret(s))
                 .ok_or(ImportError::TotpSecretInvalid)?;
-            let _ = secret;
         }
         out.push(e);
     }
@@ -207,17 +206,6 @@ pub fn parse_import_bytes(body: &[u8]) -> Result<Vec<Entry>, ImportError> {
         Err(_) => Err(ImportError::FormatRequired),
     }
 }
-
-/// `(JSON key, vault field)` in export/import order.
-const FIELD_KEYS: &[(&str, Field)] = &[
-    ("title", Field::Title),
-    ("login", Field::Login),
-    ("password", Field::Password),
-    ("url", Field::Url),
-    ("note", Field::Note),
-    ("tags", Field::Tags),
-    ("totp", Field::Totp),
-];
 
 #[cfg(test)]
 mod tests {

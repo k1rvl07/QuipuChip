@@ -6,6 +6,19 @@ publish = false
 
 [workspace]
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+mem_forget = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[lints]
+workspace = true
+
 [dependencies]
 embassy-executor = "0.10.0"
 embassy-sync = "0.8"

@@ -22,12 +22,12 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as Cs;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex as AsyncMutex;
-use pm_core::auth::{
-    Auth, Job, JobId, JobResult, KeyfileAction, NO_JOB, SESSION_TOKEN_HEX_LEN, State,
-};
+use pm_core::auth::{Auth, Job, JobId, JobResult, KeyfileAction, NO_JOB, State};
 use pm_core::config::{MAX_ENTRIES, SESSION_TOKEN_LEN};
 use pm_core::crypto;
-use pm_core::entry::{Entry, Field, VaultError};
+use pm_core::entry::{Entry, Field};
+use pm_core::hex;
+use pm_core::types::VaultError;
 use pm_core::vault::Vault;
 
 use crate::hw::{EspClock, EspRng, now_ms};
@@ -186,41 +186,11 @@ fn publish(auth: &WorkerAuth, vault: &WorkerVault) {
         .store(vault.key_file_required(), Ordering::Relaxed);
     SHARED.entry_count.store(vault.count(), Ordering::Relaxed);
 
-    let token = auth
-        .session_token_hex()
-        .and_then(|hex| hex_decode(hex.as_bytes()));
+    let token = auth.session_token_hex().and_then(|h| {
+        let mut out = [0u8; SESSION_TOKEN_LEN];
+        hex::decode_into(h.as_bytes(), &mut out).then_some(out)
+    });
     SHARED.token.lock(|t| *t.borrow_mut() = token);
-}
-
-/// Decodes a 64-char hex string into raw token bytes, accepting either case.
-fn hex_decode(hex: &[u8]) -> Option<[u8; SESSION_TOKEN_LEN]> {
-    if hex.len() != SESSION_TOKEN_HEX_LEN {
-        return None;
-    }
-    let mut out = [0u8; SESSION_TOKEN_LEN];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = (hex_nibble(hex[i * 2])? << 4) | hex_nibble(hex[i * 2 + 1])?;
-    }
-    Some(out)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 // ── Worker ───────────────────────────────────────────────────────────────────
@@ -318,7 +288,7 @@ async fn handle(auth: &mut WorkerAuth, vault: &mut WorkerVault, cmd: Command) {
         }
         Command::EntryRemove { id } => {
             let res = match vault.remove(id) {
-                VaultError::Ok => Ok(()),
+                VaultError::None => Ok(()),
                 e => Err(e),
             };
             publish(auth, vault);
@@ -522,10 +492,10 @@ pub fn entry_count() -> u32 {
 /// case first, so an upper- or lower-case token takes the same comparison path
 /// as the reference.
 pub fn session_valid(token_hex: &str) -> bool {
-    let mut given = match hex_decode(token_hex.as_bytes()) {
-        Some(g) => g,
-        None => return false,
-    };
+    let mut given = [0u8; SESSION_TOKEN_LEN];
+    if !hex::decode_into(token_hex.as_bytes(), &mut given) {
+        return false;
+    }
     let ok = SHARED.token.lock(|t| match t.borrow().as_ref() {
         Some(expected) => crypto::ct_equal(expected, &given),
         None => false,
@@ -538,7 +508,7 @@ pub fn session_valid(token_hex: &str) -> bool {
 pub fn session_token_hex() -> Option<String> {
     SHARED.token.lock(|t| {
         let token = *t.borrow();
-        token.as_ref().map(|bytes| hex_encode(bytes))
+        token.as_ref().map(|bytes| hex::encode(bytes))
     })
 }
 
