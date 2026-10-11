@@ -17,3 +17,8 @@ compile_commands.json
 
 # repowise wiki index
 .repowise/
+
+# Local agent/editor tooling (repowise-generated)
+/.claude/
+/.vscode/
+/.mcp.json
