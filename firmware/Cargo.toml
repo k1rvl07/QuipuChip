@@ -1,0 +1,35 @@
+[package]
+name = "pm-firmware"
+version = "0.2.0"
+edition = "2021"
+description = "PassManager firmware for ESP32-S3 (USB-NCM + HTTP, Rust)"
+
+[dependencies]
+esp-idf-svc = "0.53"
+esp-idf-hal = "0.47"
+esp-idf-sys = "0.38"
+anyhow = "1"
+log = "0.4"
+serde_json = "1"
+
+pm-core = { path = "../core" }
+
+[build-dependencies]
+embuild = "0.33.5"
+
+[package.metadata.esp-idf-sys]
+esp_idf_version = "v5.5.5"
+esp_idf_tools_install_dir = "workspace"
+
+# Local IDF component wrapping the vendored NCM-only TinyUSB tree (lib/tinyusb).
+# Builds the same 27 files as the PlatformIO firmware and generates Rust
+# bindings (module `pm_tinyusb`) for tusb/tud_* and the USB PHY helper.
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components/pm_tinyusb"]
+bindings_header = "components/pm_tinyusb/include/pm_tinyusb.h"
+bindings_module = "pm_tinyusb"
+
+# LittleFS for the `web` partition holding the SPA assets. Built with page size
+# 256 to match the image produced by scripts/build_webfs.py.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "joltwallet/littlefs", version = "1.22.3" }
