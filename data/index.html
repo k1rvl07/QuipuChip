@@ -17,10 +17,14 @@
     <header class="header">
       <div class="container header__inner">
         <h1 class="header__title">PassManager</h1>
-        <div class="header__controls" id="headerControls" hidden>
-          <button id="btnRekey" class="btn btn--ghost" title="Сменить мастер-пароль">Сменить пароль</button>
-          <button id="btnLock" class="btn btn--ghost" title="Заблокировать хранилище">Заблокировать</button>
-          <button id="btnReset" class="btn btn--danger-ghost" title="Полностью сбросить устройство">Сбросить</button>
+        <div class="header__right">
+          <a id="btnCert" class="btn btn--ghost" href="/install.html" target="_blank" rel="noopener"
+            title="Установка сертификата устройства">Сертификат</a>
+          <div class="header__controls" id="headerControls" hidden>
+            <button id="btnRekey" class="btn btn--ghost" title="Сменить мастер-пароль">Сменить пароль</button>
+            <button id="btnLock" class="btn btn--ghost" title="Заблокировать хранилище">Заблокировать</button>
+            <button id="btnReset" class="btn btn--danger-ghost" title="Полностью сбросить устройство">Сбросить</button>
+          </div>
         </div>
       </div>
     </header>
@@ -352,6 +356,10 @@
           </footer>
         </form>
       </dialog>
+
+      <!-- Установка сертификата вынесена на отдельную страницу /install.html,
+           которую отдаёт и HTTP (для бутстрапа), и HTTPS. Кнопка «Сертификат»
+           в шапке ведёт туда. -->
     </main>
 
     <footer class="footer container">

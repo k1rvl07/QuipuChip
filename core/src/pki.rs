@@ -35,7 +35,8 @@ use x509_cert::der::oid::AssociatedOid;
 use x509_cert::ext::Extension;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName,
+    AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages,
+    SubjectAltName, SubjectKeyIdentifier,
 };
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
@@ -155,6 +156,19 @@ fn signature_algorithm() -> Result<AlgorithmIdentifierOwned, PkiError> {
     })
 }
 
+/// RFC 5280 key identifier (method 1): SHA-1 over the raw subjectPublicKey bits.
+///
+/// `rustls`/OpenSSL only compare these for equality, but Chromium's verifier
+/// needs the CA's subject key identifier and the leaf's matching authority key
+/// identifier present or it reports `ERR_CERT_AUTHORITY_INVALID` even when the
+/// root is trusted.
+fn key_identifier(spki: &SubjectPublicKeyInfoOwned) -> Result<OctetString, PkiError> {
+    use sha1::{Digest, Sha1};
+
+    let digest = Sha1::digest(spki.subject_public_key.raw_bytes());
+    OctetString::new(digest.to_vec()).map_err(|_| PkiError::Encode)
+}
+
 /// Encodes `value` as a v3 extension with the given criticality.
 fn extension<T>(value: &T, critical: bool) -> Result<Extension, PkiError>
 where
@@ -200,7 +214,11 @@ pub fn generate(
         not_after: unix_time(params.not_after)?,
     };
 
-    // Root: BasicConstraints CA:TRUE, KeyUsage keyCertSign+cRLSign.
+    let ca_spki = spki(ca_key.verifying_key())?;
+    let ca_ski = key_identifier(&ca_spki)?;
+
+    // Root: BasicConstraints CA:TRUE, KeyUsage keyCertSign+cRLSign,
+    // SubjectKeyIdentifier (so the leaf can point at it).
     let ca_extensions = vec![
         extension(
             &BasicConstraints {
@@ -210,6 +228,7 @@ pub fn generate(
             true,
         )?,
         extension(&KeyUsage(KeyUsages::KeyCertSign | KeyUsages::CRLSign), true)?,
+        extension(&SubjectKeyIdentifier(ca_ski.clone()), false)?,
     ];
     let ca_tbs = TbsCertificate {
         version: Version::V3,
@@ -218,14 +237,17 @@ pub fn generate(
         issuer: ca_subject.clone(),
         validity,
         subject: ca_subject.clone(),
-        subject_public_key_info: spki(ca_key.verifying_key())?,
+        subject_public_key_info: ca_spki,
         issuer_unique_id: None,
         subject_unique_id: None,
         extensions: Some(ca_extensions),
     };
     let ca_cert = sign_tbs(ca_tbs, &ca_key)?;
 
-    // Leaf: BasicConstraints CA:FALSE, SAN (IP), EKU serverAuth, KeyUsage DS.
+    // Leaf: BasicConstraints CA:FALSE, SAN (IP), EKU serverAuth, KeyUsage DS,
+    // plus its own SubjectKeyIdentifier and an AuthorityKeyIdentifier pointing
+    // at the CA (Chromium needs the pair to build the path to a trusted root).
+    let leaf_spki = spki(leaf_key.verifying_key())?;
     let san = SubjectAltName(vec![GeneralName::IpAddress(
         OctetString::new(params.san_ip.to_vec()).map_err(|_| PkiError::Encode)?,
     )]);
@@ -243,6 +265,14 @@ pub fn generate(
         extension(&san, false)?,
         extension(&eku, false)?,
         extension(&KeyUsage(KeyUsages::DigitalSignature.into()), true)?,
+        extension(&SubjectKeyIdentifier(key_identifier(&leaf_spki)?), false)?,
+        extension(
+            &AuthorityKeyIdentifier {
+                key_identifier: Some(ca_ski),
+                ..Default::default()
+            },
+            false,
+        )?,
     ];
     let leaf_tbs = TbsCertificate {
         version: Version::V3,
@@ -251,7 +281,7 @@ pub fn generate(
         issuer: ca_subject,
         validity,
         subject: leaf_subject,
-        subject_public_key_info: spki(leaf_key.verifying_key())?,
+        subject_public_key_info: leaf_spki,
         issuer_unique_id: None,
         subject_unique_id: None,
         extensions: Some(leaf_extensions),
@@ -494,6 +524,27 @@ mod tests {
         .unwrap();
         let server_auth = ObjectIdentifier::new(TLS_OID_SERVER_AUTH).unwrap();
         assert!(eku.0.contains(&server_auth));
+
+        // Chromium requires the CA's subject key identifier and the leaf's
+        // matching authority key identifier to link the chain to the root.
+        let ca_ski = SubjectKeyIdentifier::from_der(
+            find_ext(&ca, SubjectKeyIdentifier::OID)
+                .unwrap()
+                .extn_value
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(ca_ski.0.as_bytes().len(), 20);
+        assert!(find_ext(&leaf, SubjectKeyIdentifier::OID).is_some());
+
+        let leaf_aki = AuthorityKeyIdentifier::from_der(
+            find_ext(&leaf, AuthorityKeyIdentifier::OID)
+                .unwrap()
+                .extn_value
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(leaf_aki.key_identifier.as_ref(), Some(&ca_ski.0));
     }
 
     #[test]

@@ -6,6 +6,19 @@
 //! method + path itself. That keeps the route table in one place and lets the
 //! auth worker's async client API be awaited directly from the handler.
 //!
+//! The dispatcher is parameterized by a const `INSTALL` flag. Over TLS
+//! (`INSTALL = false`) the full SPA and API are reachable. Over plain HTTP
+//! (`INSTALL = true`) only the certificate-install flow is exposed — the install
+//! page itself plus the CA download and identity endpoints:
+//!
+//! - `GET /` , `/index.html` , `/install.html` — certificate-install page
+//! - `GET /ca.pem` — root CA, PEM
+//! - `GET /ca.crt` — root CA, DER
+//! - `GET /api/pki/info` — CA/leaf identity and SHA-256 fingerprint
+//!
+//! Everything else on HTTP answers 404, so a browser that has not yet trusted
+//! the device CA cannot reach the vault API or the SPA bundle.
+//!
 //! Every response is built from a small [`Outcome`] so the JSON headers
 //! (`Cache-Control: no-store`, `X-Content-Type-Options: nosniff`) cannot be
 //! forgotten on one path and not another.
@@ -29,6 +42,7 @@ use serde_json::{Value, json};
 
 use crate::authsvc;
 use crate::hw::now_ms;
+use crate::tls;
 use crate::web;
 
 /// JSON request body cap, matching `config::kHttpMaxBody`.
@@ -159,6 +173,11 @@ enum Outcome {
         bytes: &'static [u8],
         mime: &'static str,
     },
+    Download {
+        body: Vec<u8>,
+        content_type: &'static str,
+        disposition: &'static str,
+    },
     Empty {
         status: u16,
     },
@@ -218,16 +237,37 @@ where
                 .write_response(conn, Response::empty(StatusCode::new(status)))
                 .await
         }
+        Outcome::Download {
+            body,
+            content_type,
+            disposition,
+        } => {
+            let headers = [
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Content-Disposition", disposition),
+            ];
+            let resp = Response::new(
+                StatusCode::OK,
+                Typed {
+                    bytes: body,
+                    content_type,
+                },
+            )
+            .with_headers(&headers[..]);
+            writer.write_response(conn, resp).await
+        }
     }
 }
 
 // ── Routing ──────────────────────────────────────────────────────────────────
 
 /// Forwards every request to [`route`]. Registered with
-/// `Router::from_service(Dispatcher)`.
-pub struct Dispatcher;
+/// `Router::from_service(Dispatcher::<INSTALL>)`. `INSTALL = true` selects the
+/// plain-HTTP certificate-install subset (see the module docs).
+pub struct Dispatcher<const INSTALL: bool>;
 
-impl PathRouterService for Dispatcher {
+impl<const INSTALL: bool> PathRouterService for Dispatcher<INSTALL> {
     async fn call_path_router_service<R: Read, W: ResponseWriter<Error = R::Error>>(
         &self,
         _state: &(),
@@ -242,7 +282,7 @@ impl PathRouterService for Dispatcher {
         let path_str = path.encoded();
         let mut body = request.body_connection;
 
-        let outcome = match route(method, path_str, parts, &mut body).await {
+        let outcome = match route::<INSTALL, R>(method, path_str, parts, &mut body).await {
             Ok(o) => o,
             Err(e) => e.into_outcome(),
         };
@@ -252,16 +292,32 @@ impl PathRouterService for Dispatcher {
     }
 }
 
-async fn route<R: Read>(
+async fn route<const INSTALL: bool, R: Read>(
     method: &str,
     path: &str,
     parts: RequestParts<'_>,
     body: &mut RequestBodyConnection<'_, R>,
 ) -> Result<Outcome, HttpError> {
+    if INSTALL {
+        return install_route(method, path);
+    }
+
     match path {
         "/api/health" => {
             method_is(method, "GET")?;
             return Ok(health());
+        }
+        "/api/pki/info" => {
+            method_is(method, "GET")?;
+            return pki_info();
+        }
+        "/ca.pem" => {
+            method_is(method, "GET")?;
+            return ca_pem();
+        }
+        "/ca.crt" => {
+            method_is(method, "GET")?;
+            return ca_der();
         }
         "/api/auth/state" => {
             method_is(method, "GET")?;
@@ -337,6 +393,37 @@ async fn route<R: Read>(
         return Err(method_not_allowed());
     }
     Ok(static_asset(path))
+}
+
+/// Plain-HTTP subset: only the certificate-install flow. Anything outside it is
+/// an empty 404 so a browser sees no API surface until the CA is trusted.
+fn install_route(method: &str, path: &str) -> Result<Outcome, HttpError> {
+    match path {
+        "/" | "/index.html" | "/install.html" => {
+            method_is(method, "GET")?;
+            Ok(install_page())
+        }
+        "/ca.pem" => {
+            method_is(method, "GET")?;
+            ca_pem()
+        }
+        "/ca.crt" => {
+            method_is(method, "GET")?;
+            ca_der()
+        }
+        "/api/pki/info" => {
+            method_is(method, "GET")?;
+            pki_info()
+        }
+        _ => Ok(Outcome::Empty { status: 404 }),
+    }
+}
+
+fn install_page() -> Outcome {
+    Outcome::Static {
+        bytes: web::install_page(),
+        mime: "text/html; charset=utf-8",
+    }
 }
 
 fn method_is(method: &str, expected: &str) -> Result<(), HttpError> {
@@ -736,6 +823,57 @@ fn health() -> Outcome {
             "web_total_kb": total_kb,
         }),
     )
+}
+
+/// The root CA as PEM, for browser and OS trust imports.
+fn ca_pem() -> Result<Outcome, HttpError> {
+    let Some(der) = tls::ca_cert_der() else {
+        return Err(internal("ca_unavailable"));
+    };
+    let body = pm_core::pki::pem("CERTIFICATE", &der).into_bytes();
+    Ok(Outcome::Download {
+        body,
+        content_type: "application/x-pem-file",
+        disposition: "attachment; filename=\"PassManager-CA.pem\"",
+    })
+}
+
+/// The root CA as DER, for importers that expect a `.crt` binary.
+fn ca_der() -> Result<Outcome, HttpError> {
+    let Some(der) = tls::ca_cert_der() else {
+        return Err(internal("ca_unavailable"));
+    };
+    Ok(Outcome::Download {
+        body: der,
+        content_type: "application/x-x509-ca-cert",
+        disposition: "attachment; filename=\"PassManager-CA.crt\"",
+    })
+}
+
+/// Formats an IPv4 address as dotted decimal, for the certificate SAN shown to
+/// the user.
+fn ipv4_dotted(ip: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
+
+/// Identity of the served certificate, for the UI to show and verify.
+fn pki_info() -> Result<Outcome, HttpError> {
+    let Some(der) = tls::ca_cert_der() else {
+        return Err(internal("ca_unavailable"));
+    };
+    let sha256 = pm_core::hex::encode(&pm_core::crypto::sha256(&der));
+    Ok(json_outcome(
+        200,
+        json!({
+            "ok": true,
+            "caCommonName": pm_core::config::TLS_CA_CN,
+            "leafCommonName": pm_core::config::TLS_LEAF_CN,
+            "san": ipv4_dotted(DEVICE_IP),
+            "notBeforeUnix": pm_core::config::TLS_VALID_FROM_UNIX,
+            "notAfterUnix": pm_core::config::TLS_VALID_UNTIL_UNIX,
+            "sha256": sha256,
+        }),
+    ))
 }
 
 fn auth_state() -> Outcome {

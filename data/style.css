@@ -720,6 +720,13 @@ html, body {
   font-size: 0.9rem;
 }
 
+.header__right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
 @media (max-width: 640px) {
   .header__inner {
     flex-direction: column;

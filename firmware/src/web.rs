@@ -14,9 +14,14 @@ pub struct Asset {
     pub bytes: &'static [u8],
 }
 
+/// The certificate-install page, served both on plain HTTP (the only page a
+/// browser may reach before trusting the CA) and over HTTPS.
+const INSTALL_HTML: &[u8] = include_bytes!("../../data/install.html");
+
 /// The embedded bundle. Mirrors the file set of the reference's `data/`.
 const ASSETS: &[(&str, &[u8])] = &[
     ("index.html", include_bytes!("../../data/index.html")),
+    ("install.html", INSTALL_HTML),
     ("style.css", include_bytes!("../../data/style.css")),
     ("app.js", include_bytes!("../../data/app.js")),
     ("kdbx-shim.js", include_bytes!("../../data/kdbx-shim.js")),
@@ -29,6 +34,11 @@ const ASSETS: &[(&str, &[u8])] = &[
 const INDEX_FILE: &str = "index.html";
 /// Longest accepted normalized path, matching `config::kWebPathMax`.
 const PATH_MAX: usize = 256;
+
+/// The certificate-install page bytes, for the plain-HTTP handler.
+pub fn install_page() -> &'static [u8] {
+    INSTALL_HTML
+}
 
 /// Total embedded asset bytes, for the health probe.
 pub fn total_bytes() -> u32 {

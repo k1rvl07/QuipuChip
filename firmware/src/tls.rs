@@ -18,6 +18,8 @@ use core::cell::RefCell;
 
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as Cs;
 use esp_storage::FlashStorage;
 use getrandom::register_custom_getrandom;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
@@ -196,7 +198,7 @@ impl<'s> TlsStream<'s> {
                     }
                     Ok(ConnectionState::TransmitTlsData(tx)) => tx.done(),
                     Ok(ConnectionState::BlockedHandshake | ConnectionState::WriteTraffic(_)) => {
-                        step = Step::NeedRead
+                        step = Step::NeedRead;
                     }
                     Ok(ConnectionState::PeerClosed | ConnectionState::Closed) => step = Step::Eof,
                     Ok(_) => {}
@@ -471,6 +473,32 @@ impl TimeProvider for BootTime {
     }
 }
 
+/// DER of the root CA in use, published once at boot so the HTTP layer can hand
+/// it to browsers through `/ca.pem`, `/ca.crt` and `/api/pki/info`. Empty until
+/// [`load_or_generate`] runs.
+static CA_CERT_DER: BlockingMutex<Cs, RefCell<Vec<u8>>> =
+    BlockingMutex::new(RefCell::new(Vec::new()));
+
+/// Publishes the root CA DER for the certificate-install endpoints.
+pub fn set_ca_cert(der: &[u8]) {
+    CA_CERT_DER.lock(|cell| {
+        *cell.borrow_mut() = der.to_vec();
+    });
+}
+
+/// Returns a copy of the root CA DER, or `None` when no material was loaded.
+#[must_use]
+pub fn ca_cert_der() -> Option<Vec<u8>> {
+    CA_CERT_DER.lock(|cell| {
+        let der = cell.borrow();
+        if der.is_empty() {
+            None
+        } else {
+            Some(der.clone())
+        }
+    })
+}
+
 /// Loads the stored certificate material from the `tls` partition, or mints a
 /// fresh CA + server pair and stores it when the region is empty/corrupt.
 ///
@@ -489,6 +517,7 @@ pub fn load_or_generate(
         && let Some(material) = pm_core::pki::TlsMaterial::decode(&buf)
     {
         log::info!("tls: loaded stored certificate material");
+        set_ca_cert(&material.ca_cert_der);
         return Ok(material);
     }
 
@@ -504,6 +533,7 @@ pub fn load_or_generate(
         .map_err(|_| "certificate generation failed")?;
     persist(flash, base, size, &material.encode())?;
     log::info!("tls: certificate material generated and stored");
+    set_ca_cert(&material.ca_cert_der);
     Ok(material)
 }
 

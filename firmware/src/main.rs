@@ -55,6 +55,9 @@ use authsvc::WorkerAuth;
 use hw::{EspClock, EspRng};
 
 static WEBSERVER: StaticCell<picoserve::Router<AppRouter>> = StaticCell::new();
+/// Plaintext HTTP server: only the certificate-install page and the CA
+/// endpoints are reachable here, never the SPA or the API.
+static INSTALL_SERVER: StaticCell<picoserve::Router<InstallRouter>> = StaticCell::new();
 static SERVER_CONFIG: picoserve::Config =
     picoserve::Config::const_default().keep_connection_alive();
 
@@ -239,9 +242,10 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(run_dhcp(stack).unwrap());
 
-    let webserver = WEBSERVER.init_with(|| AppBuilder.build_app());
+    let webserver = WEBSERVER.init_with(|| AppBuilder::<false>.build_app());
+    let install_server = INSTALL_SERVER.init_with(|| AppBuilder::<true>.build_app());
     for task_id in 0..WEB_TASK_POOL_SIZE {
-        spawner.spawn(web_task(task_id, webserver, stack).unwrap());
+        spawner.spawn(install_task(task_id, install_server, stack).unwrap());
     }
     spawner.spawn(auth_tick_task().unwrap());
     match tls_config {
@@ -367,9 +371,9 @@ async fn run_dhcp(stack: Stack<'static>) {
 }
 
 #[task(pool_size = WEB_TASK_POOL_SIZE)]
-async fn web_task(
+async fn install_task(
     task_id: usize,
-    app: &'static picoserve::Router<AppRouter>,
+    app: &'static picoserve::Router<InstallRouter>,
     stack: Stack<'static>,
 ) -> ! {
     let mut tcp_rx_buffer = [0; 1024];
@@ -388,16 +392,30 @@ async fn web_task(
         .into_never()
 }
 
-/// Zero-sized picoserve app builder used to define [`AppRouter`].
-pub struct AppBuilder;
+/// Zero-sized picoserve app builder used to define [`AppRouter`] and
+/// [`InstallRouter`]. The const parameter selects the HTTP variant: `false` is
+/// the full SPA + API served over HTTPS, `true` only exposes the certificate
+/// install page and the CA endpoints over plain HTTP.
+pub struct AppBuilder<const INSTALL: bool>;
 
-/// Router type produced by [`AppBuilder`].
-pub type AppRouter = <AppBuilder as AppBuilderTrait>::PathRouter;
+/// Router type of the full HTTPS application.
+pub type AppRouter = <AppBuilder<false> as AppBuilderTrait>::PathRouter;
 
-impl AppBuilderTrait for AppBuilder {
+/// Router type of the certificate-install HTTP application.
+pub type InstallRouter = <AppBuilder<true> as AppBuilderTrait>::PathRouter;
+
+impl AppBuilderTrait for AppBuilder<false> {
     type PathRouter = impl picoserve::routing::PathRouter;
 
     fn build_app(self) -> picoserve::Router<Self::PathRouter> {
-        picoserve::Router::from_service(http::Dispatcher)
+        picoserve::Router::from_service(http::Dispatcher::<false>)
+    }
+}
+
+impl AppBuilderTrait for AppBuilder<true> {
+    type PathRouter = impl picoserve::routing::PathRouter;
+
+    fn build_app(self) -> picoserve::Router<Self::PathRouter> {
+        picoserve::Router::from_service(http::Dispatcher::<true>)
     }
 }
