@@ -1,8 +1,34 @@
 //! Strict RFC 4648 base64 (standard alphabet, padding only in the last group).
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::config::KEYFILE_MAX_BYTES;
+
+/// Encodes bytes as standard RFC 4648 base64 with padding.
+#[must_use]
+pub fn encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(char::from(ALPHABET[((n >> 18) & 63) as usize]));
+        out.push(char::from(ALPHABET[((n >> 12) & 63) as usize]));
+        out.push(if chunk.len() > 1 {
+            char::from(ALPHABET[((n >> 6) & 63) as usize])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(ALPHABET[(n & 63) as usize])
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 fn value(c: u8) -> Option<u8> {
     match c {
@@ -58,6 +84,32 @@ mod tests {
         assert_eq!(decode("TWFu").unwrap(), b"Man");
         assert_eq!(decode("TWE=").unwrap(), b"Ma");
         assert_eq!(decode("TQ==").unwrap(), b"M");
+    }
+
+    #[test]
+    fn encodes_known_vectors() {
+        assert_eq!(encode(b""), "");
+        assert_eq!(encode(b"f"), "Zg==");
+        assert_eq!(encode(b"fo"), "Zm8=");
+        assert_eq!(encode(b"foo"), "Zm9v");
+        assert_eq!(encode(b"foob"), "Zm9vYg==");
+        assert_eq!(encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(encode(&[0x00, 0x01, 0x02, 0xfd, 0xfe, 0xff]), "AAEC/f7/");
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        for sample in [
+            &b"f"[..],
+            b"fo",
+            b"foo",
+            b"foob",
+            b"foobar",
+            b"\x00\x01\x02\xfd\xfe\xff",
+        ] {
+            assert_eq!(decode(&encode(sample)).unwrap(), sample.to_vec());
+        }
     }
 
     #[test]

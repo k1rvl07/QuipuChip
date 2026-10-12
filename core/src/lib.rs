@@ -25,6 +25,7 @@ pub mod entry;
 pub mod export;
 pub mod hex;
 pub mod password;
+pub mod pki;
 pub mod rand;
 pub mod totp;
 pub mod types;

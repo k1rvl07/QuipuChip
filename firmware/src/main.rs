@@ -44,8 +44,10 @@ mod hw;
 mod mem;
 mod selftest;
 mod storage;
+mod tls;
 mod web;
 
+use pm_core::pki::TlsMaterial;
 use pm_core::vault::Vault;
 use storage::VaultStorage;
 
@@ -70,7 +72,8 @@ static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 const WEB_TASK_POOL_SIZE: usize = http::MAX_SESSIONS;
 /// Connection sockets plus the DHCP server's UDP socket and the spare slot
 /// `embassy-net` reserves for DNS.
-const NET_SOCKETS: usize = WEB_TASK_POOL_SIZE + 2;
+// The plaintext and TLS task pools, the DHCP server socket, and two spare.
+const NET_SOCKETS: usize = WEB_TASK_POOL_SIZE + tls::TLS_TASK_POOL_SIZE + 4;
 const ETHERNET_MTU: usize = 1514;
 const HTTP_PORT: u16 = 80;
 const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 7, 1);
@@ -108,11 +111,13 @@ async fn main(spawner: Spawner) -> ! {
         None => log::error!("device factor: eFuse MAC unreadable"),
     }
 
-    // Open the vault partition directly (no filesystem) and restore state.
+    // Open the vault partition directly (no filesystem) and restore state, and
+    // load (or mint) the TLS material from the `tls` partition. Both are
+    // resolved here because the flash peripheral is handed over exactly once.
     let flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
     let mac = mac6.unwrap_or([0u8; 6]);
-    let mut vault = match open_vault(flash) {
-        Ok(store) => {
+    let (mut vault, tls_config) = match open_partitions(flash) {
+        Ok((store, material)) => {
             let base = store.base();
             let size = store.size();
             let mut vault = Vault::new(store, mac);
@@ -126,7 +131,12 @@ async fn main(spawner: Spawner) -> ! {
                 vault.provisioned(),
                 vault.count()
             );
-            vault
+            let tls_config = material.as_ref().and_then(|m| {
+                tls::build_config(m)
+                    .inspect_err(|e| log::error!("tls: configuration failed: {e}"))
+                    .ok()
+            });
+            (vault, tls_config)
         }
         Err(e) => {
             // The vault partition is required by `partitions.csv`; without it
@@ -174,9 +184,9 @@ async fn main(spawner: Spawner) -> ! {
 
     let driver = UsbDriver::new(usb, EP_OUT_BUFFER.init([0u8; 1024]), Config::default());
 
-    // Device/config descriptor identity mirrors the reference in
-    // `firmware/components/pm_tinyusb/pm_usb.c` (`PM_USB_BCD_*`, string table,
-    // remote-wakeup attribute), so the host sees the same USB identity.
+    // Device/config descriptor identity mirrors the original USB reference
+    // (`PM_USB_BCD_*`, string table, remote-wakeup attribute), so the host sees
+    // the same USB identity.
     let mut config = embassy_usb::Config::new(0x303A, 0x4001);
     config.bcd_usb = embassy_usb::UsbVersion::Two;
     config.device_release = 0x0100;
@@ -234,27 +244,60 @@ async fn main(spawner: Spawner) -> ! {
         spawner.spawn(web_task(task_id, webserver, stack).unwrap());
     }
     spawner.spawn(auth_tick_task().unwrap());
+    match tls_config {
+        Some(config) => {
+            for _ in 0..tls::TLS_TASK_POOL_SIZE {
+                spawner.spawn(tls::tls_task(webserver, stack, config.clone()).unwrap());
+            }
+        }
+        None => log::warn!("tls: no certificate material; HTTPS server disabled"),
+    }
     log::info!("[pm] boot complete; entering idle");
 
     core::future::pending().await
 }
 
-/// Reads the partition table, finds the `vault` partition and wraps it as a
-/// [`pm_core::vault::Storage`].
-fn open_vault(flash: FlashStorage<'static>) -> Result<VaultStorage, &'static str> {
+/// Reads the partition table, wraps the `vault` partition as a
+/// [`pm_core::vault::Storage`] and loads (or mints) the certificate material
+/// from the `tls` partition.
+///
+/// The flash peripheral is handed over exactly once, so both partitions are
+/// resolved here; the vault only takes ownership once the `tls` region has been
+/// read or rewritten.
+fn open_partitions(
+    flash: FlashStorage<'static>,
+) -> Result<(VaultStorage, Option<TlsMaterial>), &'static str> {
     let mut flash = flash;
     let mut table_buf = alloc::vec![0u8; partitions::PARTITION_TABLE_MAX_LEN];
-    let table = partitions::read_partition_table(&mut flash, &mut table_buf)
-        .map_err(|_| "partition table unreadable")?;
 
-    let entry = table
-        .iter()
-        .find(|e| e.label_as_str() == "vault")
-        .ok_or("no `vault` partition")?;
+    let (vault_base, vault_size, tls_region) = {
+        let table = partitions::read_partition_table(&mut flash, &mut table_buf)
+            .map_err(|_| "partition table unreadable")?;
+        let vault = table
+            .iter()
+            .find(|e| e.label_as_str() == "vault")
+            .ok_or("no `vault` partition")?;
+        let tls = table
+            .iter()
+            .find(|e| e.label_as_str() == "tls")
+            .map(|e| (e.offset(), e.len() as usize));
+        (vault.offset(), vault.len() as usize, tls)
+    };
 
-    let base = entry.offset();
-    let size = entry.len() as usize;
-    Ok(VaultStorage::new(flash, base, size))
+    let material = if let Some((base, size)) = tls_region {
+        match tls::load_or_generate(&mut flash, base, size) {
+            Ok(material) => Some(material),
+            Err(e) => {
+                log::error!("tls: {e}; HTTPS server will be disabled");
+                None
+            }
+        }
+    } else {
+        log::warn!("tls: no `tls` partition; HTTPS server will be disabled");
+        None
+    };
+
+    Ok((VaultStorage::new(flash, vault_base, vault_size), material))
 }
 
 #[task]

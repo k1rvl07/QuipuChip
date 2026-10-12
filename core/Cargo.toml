@@ -25,3 +25,5 @@ hmac = { version = "0.12", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 subtle = { version = "2", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "pkcs8", "alloc"] }
+x509-cert = { version = "0.2", default-features = false }

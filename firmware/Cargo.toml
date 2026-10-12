@@ -79,6 +79,9 @@ edge-dhcp = "0.8.0"
 edge-nal = "0.7.0"
 edge-nal-embassy = "0.9.0"
 picoserve = { version = "0.19", default-features = false, features = ["embassy", "alloc"] }
+rustls = { version = "0.23", default-features = false }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc"] }
+getrandom = { version = "0.2", features = ["custom"] }
 static_cell = "2.1.0"
 log = "0.4"
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
@@ -107,3 +110,11 @@ opt-level = 2
 # untested; keep it off until re-verified on hardware.
 lto = false
 codegen-units = 1
+
+# Xtensa LLVM backend bug: for opt-level >= 1 it fails to select
+# `XtensaISD::PCREL_WRAPPER` for a constant pool inside `rustls`
+# ("Cannot select ... NewSessionTicketExtensions"), aborting the release build.
+# Unoptimized is the only level that codegens; the handshake's CPU hot path
+# (AES-GCM, ECDSA, X25519) lives in the RustCrypto crates, which stay optimized.
+[profile.release.package.rustls]
+opt-level = 0

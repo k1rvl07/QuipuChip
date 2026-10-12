@@ -11,11 +11,13 @@
 mod auth;
 mod crypto;
 mod password;
+mod tls;
 mod vault;
 
 pub use auth::*;
 pub use crypto::*;
 pub use password::*;
+pub use tls::*;
 pub use vault::*;
 
 /// Firmware version reported over the API (`config::kFirmwareVersion`).
