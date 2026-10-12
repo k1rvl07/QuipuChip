@@ -2,7 +2,11 @@
 target = "xtensa-esp32s3-none-elf"
 
 [target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor"
+# Flash the app together with the project's partition table (`partitions.csv`,
+# repo root). Without this, `espflash` writes a default single-factory table and
+# the `vault` partition disappears (`vault: not available`).
+# Relies on cwd being `firmware-embassy/` (cargo manifest dir).
+runner = "espflash flash --partition-table ../partitions.csv --monitor"
 # Pin GNU ld >= 2.43.1 from the espup toolchain. The otherwise-convenient
 # PlatformIO `toolchain-xtensa-esp32s3` ships GNU ld 2.35.1, which mis-sizes the
 # esp-hal NOLOAD dummy sections and shifts `.data` by 0x40 in the image, so all

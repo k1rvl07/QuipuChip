@@ -95,10 +95,10 @@ static FAIL: AtomicU32 = AtomicU32::new(0);
 fn report(gate: &str, ok: bool, detail: &str) {
     if ok {
         PASS.fetch_add(1, Ordering::Relaxed);
-        log::info!("gate {:<20} PASS {}", gate, detail);
+        log::info!("gate {gate:<20} PASS {detail}");
     } else {
         FAIL.fetch_add(1, Ordering::Relaxed);
-        log::error!("gate {:<20} FAIL {}", gate, detail);
+        log::error!("gate {gate:<20} FAIL {detail}");
     }
 }
 

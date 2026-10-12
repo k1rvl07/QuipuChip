@@ -1,7 +1,9 @@
 [package]
 name = "firmware-embassy"
-version = "0.0.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace]
@@ -9,12 +11,47 @@ publish = false
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+non_ascii_idents = "deny"
+unused_qualifications = "deny"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+single_use_lifetimes = "warn"
+let_underscore_drop = "warn"
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+unused_extern_crates = "warn"
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
 mem_forget = "deny"
 todo = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
 undocumented_unsafe_blocks = "deny"
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+enum_glob_use = "allow"
+wildcard_imports = "allow"
+unreadable_literal = "allow"
+many_single_char_names = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+needless_pass_by_value = "allow"
+too_many_lines = "allow"
+float_cmp = "allow"
+default_trait_access = "allow"
+redundant_else = "allow"
 
 [lints]
 workspace = true

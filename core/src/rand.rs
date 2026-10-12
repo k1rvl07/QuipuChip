@@ -21,6 +21,7 @@ pub struct CycleSource<'a> {
 }
 
 impl<'a> CycleSource<'a> {
+    /// Creates a source replaying `data` cyclically.
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }

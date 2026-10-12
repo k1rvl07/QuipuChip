@@ -1,0 +1,6 @@
+# Restriction lints (`unwrap_used`/`expect_used`/`panic`) are enforced in
+# production code but waived inside `#[cfg(test)]`, where panicking on a failed
+# expectation is the intended assertion mechanism.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

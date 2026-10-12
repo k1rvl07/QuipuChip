@@ -34,7 +34,7 @@ use crate::web;
 /// JSON request body cap, matching `config::kHttpMaxBody`.
 const MAX_BODY: usize = 8192;
 /// Matches `config::kHttpMaxSessions`.
-const MAX_SESSIONS: usize = 4;
+pub(crate) const MAX_SESSIONS: usize = 4;
 /// The device's own address, used for the `Host`/`Origin` same-origin check.
 const DEVICE_IP: [u8; 4] = [192, 168, 7, 1];
 
@@ -317,7 +317,7 @@ async fn route<R: Read>(
         let well_formed = !rest.is_empty() && !rest.contains('/');
         if well_formed {
             if method == "GET" {
-                return job_poll(path).await;
+                return job_poll(path);
             }
             return Err(method_not_allowed());
         }
@@ -336,7 +336,7 @@ async fn route<R: Read>(
     if method != "GET" {
         return Err(method_not_allowed());
     }
-    static_asset(path)
+    Ok(static_asset(path))
 }
 
 fn method_is(method: &str, expected: &str) -> Result<(), HttpError> {
@@ -347,15 +347,15 @@ fn method_is(method: &str, expected: &str) -> Result<(), HttpError> {
     }
 }
 
-fn static_asset(path: &str) -> Result<Outcome, HttpError> {
+fn static_asset(path: &str) -> Outcome {
     match web::open(path) {
-        Some(asset) => Ok(Outcome::Static {
+        Some(asset) => Outcome::Static {
             bytes: asset.bytes,
             mime: web::mime_for(asset.name),
-        }),
+        },
         // httpd's own 404 body is not reproduced; an empty 404 is enough for
         // the SPA to detect a missing asset.
-        None => Ok(Outcome::Empty { status: 404 }),
+        None => Outcome::Empty { status: 404 },
     }
 }
 
@@ -528,7 +528,7 @@ fn host_is_device(parts: RequestParts<'_>) -> bool {
 fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut parts = s.split('.');
-    for slot in out.iter_mut() {
+    for slot in &mut out {
         let part = parts.next()?;
         if part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -815,7 +815,7 @@ async fn unlock<R: Read>(
     Ok(job_accepted(id))
 }
 
-async fn job_poll(path: &str) -> Result<Outcome, HttpError> {
+fn job_poll(path: &str) -> Result<Outcome, HttpError> {
     let Some(id) = parse_job_id(path) else {
         return Err(bad_request("bad_job_id"));
     };
@@ -1038,7 +1038,7 @@ async fn entries_write<R: Read>(
     entry.id = id;
     fill_entry(&doc, &mut entry)?;
 
-    match authsvc::entry_write(id, entry).await {
+    match authsvc::entry_write(id, &entry).await {
         Ok(new_id) => {
             let status = if is_create { 201 } else { 200 };
             Ok(json_outcome(status, json!({"ok": true, "id": new_id})))
@@ -1070,12 +1070,11 @@ async fn entry_detail(id: u32) -> Result<Outcome, HttpError> {
             return Err(internal("vault_get_failed"));
         }
     };
-    match detail_body(&e) {
-        Ok(body) => Ok(json_outcome(200, body)),
-        Err(()) => {
-            log::warn!("http: entry {id} has unterminated field");
-            Err(internal("entry_field_unterminated"))
-        }
+    if let Ok(body) = detail_body(&e) {
+        Ok(json_outcome(200, body))
+    } else {
+        log::warn!("http: entry {id} has unterminated field");
+        Err(internal("entry_field_unterminated"))
     }
 }
 
@@ -1088,12 +1087,9 @@ async fn entry_secret(id: u32) -> Result<Outcome, HttpError> {
             return Err(internal("vault_get_failed"));
         }
     };
-    let password = match field_checked(&e, Field::Password) {
-        Ok(s) => s,
-        Err(()) => {
-            log::warn!("http: entry {id} password unterminated");
-            return Err(internal("entry_field_unterminated"));
-        }
+    let Ok(password) = field_checked(&e, Field::Password) else {
+        log::warn!("http: entry {id} password unterminated");
+        return Err(internal("entry_field_unterminated"));
     };
     Ok(json_outcome(
         200,
@@ -1119,21 +1115,15 @@ async fn entry_totp(id: u32, parts: RequestParts<'_>) -> Result<Outcome, HttpErr
     if e.get(Field::Totp).is_empty() {
         return Err(conflict("totp_not_configured"));
     }
-    let secret = match core::str::from_utf8(e.get(Field::Totp)) {
-        Ok(s) => s,
-        Err(_) => {
-            log::error!("http: entry {id} totp secret unusable");
-            return Err(internal("totp_secret_invalid"));
-        }
+    let Ok(secret) = core::str::from_utf8(e.get(Field::Totp)) else {
+        log::error!("http: entry {id} totp secret unusable");
+        return Err(internal("totp_secret_invalid"));
     };
     // The secret passed `is_valid_secret` at write time; a failure here is
     // corruption, not user error.
-    let code = match pm_core::totp::compute(secret, u64::from(when)) {
-        Ok(c) => c,
-        Err(_) => {
-            log::error!("http: entry {id} totp secret unusable");
-            return Err(internal("totp_secret_invalid"));
-        }
+    let Ok(code) = pm_core::totp::compute(secret, u64::from(when)) else {
+        log::error!("http: entry {id} totp secret unusable");
+        return Err(internal("totp_secret_invalid"));
     };
     let period = pm_core::config::TOTP_PERIOD_SEC;
     Ok(json_outcome(
@@ -1154,9 +1144,8 @@ async fn entries_delete<R: Read>(
 ) -> Result<Outcome, HttpError> {
     require_same_origin(parts)?;
     require_session(parts)?;
-    let id = match entry_route(path) {
-        Some(EntryRoute::Item(id)) => id,
-        _ => return Err(bad_request("bad_entry_id")),
+    let Some(EntryRoute::Item(id)) = entry_route(path) else {
+        return Err(bad_request("bad_entry_id"));
     };
 
     // Deletion is irreversible, so it needs the same explicit confirmation as a

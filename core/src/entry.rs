@@ -14,11 +14,17 @@
 
 /// `title` capacity, including the NUL terminator.
 pub const ENTRY_TITLE: usize = 48;
+/// `login` capacity, including the NUL terminator.
 pub const ENTRY_LOGIN: usize = 96;
+/// `password` capacity, including the NUL terminator.
 pub const ENTRY_PASSWORD: usize = 160;
+/// `url` capacity, including the NUL terminator.
 pub const ENTRY_URL: usize = 192;
+/// `note` capacity, including the NUL terminator.
 pub const ENTRY_NOTE: usize = 400;
+/// `tags` capacity, including the NUL terminator (v0.2.0+).
 pub const ENTRY_TAGS: usize = 128;
+/// `totp` capacity, including the NUL terminator (v0.2.0+).
 pub const ENTRY_TOTP: usize = 64;
 
 /// Number of serialized fields, in on-disk order.
@@ -30,29 +36,60 @@ pub const ENTRY_PAYLOAD_MAX: usize =
 
 const _: () = assert!(ENTRY_PAYLOAD_MAX == 1088);
 
-/// Field selector for [`Entry::get`] / [`Entry::set`].
+/// Field selector for [`Entry::get`] / [`Entry::set`]. `#[repr(u8)]` keeps the
+/// discriminant stable for indexing and logging.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    /// Entry title.
     Title = 0,
+    /// Login/username.
     Login = 1,
+    /// Password or secret.
     Password = 2,
+    /// URL.
     Url = 3,
+    /// Free-form note.
     Note = 4,
+    /// Space-separated tags.
     Tags = 5,
+    /// TOTP secret (base32).
     Totp = 6,
+}
+
+impl core::fmt::Display for Field {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Field::Title => "title",
+            Field::Login => "login",
+            Field::Password => "password",
+            Field::Url => "url",
+            Field::Note => "note",
+            Field::Tags => "tags",
+            Field::Totp => "totp",
+        })
+    }
 }
 
 /// One vault record. Byte layout matches the C++ `vault::Entry` exactly; `id`
 /// is not part of the encrypted payload, it lives in the record header.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
+    /// Record id (not part of the encrypted payload).
     pub id: u32,
+    /// Title slot.
     pub title: [u8; ENTRY_TITLE],
+    /// Login slot.
     pub login: [u8; ENTRY_LOGIN],
+    /// Password slot.
     pub password: [u8; ENTRY_PASSWORD],
+    /// URL slot.
     pub url: [u8; ENTRY_URL],
+    /// Note slot.
     pub note: [u8; ENTRY_NOTE],
+    /// Tags slot.
     pub tags: [u8; ENTRY_TAGS],
+    /// TOTP secret slot.
     pub totp: [u8; ENTRY_TOTP],
 }
 
@@ -72,11 +109,14 @@ impl Default for Entry {
 }
 
 impl Entry {
+    /// Creates an all-zero entry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Raw fixed-capacity slot for a field.
+    #[must_use]
     pub fn raw(&self, field: Field) -> &[u8] {
         match field {
             Field::Title => &self.title,
@@ -102,6 +142,7 @@ impl Entry {
     }
 
     /// Value bytes of a field, up to the first NUL (the stored string).
+    #[must_use]
     pub fn get(&self, field: Field) -> &[u8] {
         let raw = self.raw(field);
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -134,7 +175,7 @@ impl Entry {
     /// the last byte so this can never read past the slot.
     pub fn serialize(&self, out: &mut [u8]) -> Option<usize> {
         let mut n = 0usize;
-        for &field in FIELD_ORDER.iter() {
+        for &field in &FIELD_ORDER {
             let raw = self.raw(field);
             let len = field_strlen(raw) + 1;
             if n + len > out.len() {
@@ -158,7 +199,7 @@ impl Entry {
         };
         let len = data.len();
         let mut pos = 0usize;
-        for &field in FIELD_ORDER.iter() {
+        for &field in &FIELD_ORDER {
             if pos >= len {
                 break;
             }

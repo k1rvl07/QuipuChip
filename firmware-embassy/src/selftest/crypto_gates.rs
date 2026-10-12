@@ -43,8 +43,7 @@ pub(super) fn crypto_gates() {
             continue;
         }
         if crypto::pbkdf2_hmac_sha256(pass.as_bytes(), salt.as_bytes(), *iters)
-            .map(|got| crypto::ct_equal(&got, &want))
-            .unwrap_or(false)
+            .is_ok_and(|got| crypto::ct_equal(&got, &want))
         {
             ok_count += 1;
         }
@@ -129,7 +128,6 @@ pub(super) fn crypto_gates() {
     // TOTP against RFC 6238 (SHA-1). T = 20000000000 does not fit a u32, and
     // device time is 32-bit.
     {
-        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
         const VECTORS: &[(u32, &str)] = &[
             (59, "287082"),
             (1111111109, "081804"),
@@ -137,12 +135,10 @@ pub(super) fn crypto_gates() {
             (1234567890, "005924"),
             (2000000000, "279037"),
         ];
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
         let mut ok_count = 0u32;
         for (t, expect) in VECTORS {
-            if totp::compute(secret, *t as u64)
-                .map(|code| code == *expect)
-                .unwrap_or(false)
-            {
+            if totp::compute(secret, *t as u64).is_ok_and(|code| code == *expect) {
                 ok_count += 1;
             }
         }
@@ -153,7 +149,7 @@ pub(super) fn crypto_gates() {
         report(
             "crypto-totp-rfc6238",
             ok_count == 5 && rejects,
-            &format!("{}/5 vectors, invalid rejected: {}", ok_count, rejects),
+            &format!("{ok_count}/5 vectors, invalid rejected: {rejects}"),
         );
     }
 }

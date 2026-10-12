@@ -197,18 +197,15 @@ pub(super) fn vault_gates(vault: &mut WorkerVault, gate_pw: &str, rng: &mut EspR
 
     // Index and region rebuilt by compaction must survive a reboot.
     {
+        const PROBE: u32 = 16;
         let expected = vault.count();
         let rc = vault.begin(gate_pw, None, rng);
-        const PROBE: u32 = 16;
         let (load_rc, an) = match vault.load(PROBE as usize) {
             Ok(v) => (VaultError::None, v.len() as u32),
             Err(e) => (e, 0),
         };
         let after_open = vault.count();
-        let detail = format!(
-            "count {} -> {}, {} loaded, data intact",
-            expected, after_open, an
-        );
+        let detail = format!("count {expected} -> {after_open}, {an} loaded, data intact");
         report(
             "gate6-reboot",
             rc == VaultError::None
@@ -288,13 +285,7 @@ pub(super) fn vault_gates(vault: &mut WorkerVault, gate_pw: &str, rng: &mut EspR
 
     // Header corruption. generation/iters/saltPw/saltDev/check are in the AAD.
     {
-        if vault.begin(gate_pw, None, rng) != VaultError::None {
-            report(
-                "gate3-tamper-hdr",
-                false,
-                "cannot open vault for tamper test",
-            );
-        } else {
+        if vault.begin(gate_pw, None, rng) == VaultError::None {
             let offsets = [
                 HDR_GENERATION,
                 HDR_ITERS,
@@ -314,6 +305,12 @@ pub(super) fn vault_gates(vault: &mut WorkerVault, gate_pw: &str, rng: &mut EspR
             }
             let detail = format!("{}/{} header bytes rejected", rejected, offsets.len());
             report("gate3-tamper-hdr", rejected > 0 && accepted == 0, &detail);
+        } else {
+            report(
+                "gate3-tamper-hdr",
+                false,
+                "cannot open vault for tamper test",
+            );
         }
     }
 

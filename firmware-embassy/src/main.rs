@@ -58,9 +58,19 @@ static SERVER_CONFIG: picoserve::Config =
 
 static CDC_NCM_STATE: StaticCell<CdcNcmState<'_>> = StaticCell::new();
 static NET_STATE: StaticCell<NetState<{ ETHERNET_MTU }, 4, 4>> = StaticCell::new();
-static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+static RESOURCES: StaticCell<StackResources<NET_SOCKETS>> = StaticCell::new();
 
-const WEB_TASK_POOL_SIZE: usize = 1;
+static EP_OUT_BUFFER: StaticCell<[u8; 1024]> = StaticCell::new();
+static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+
+/// One HTTP connection per task (`picoserve` serves at most one connection per
+/// `listen_and_serve`), one task per session allowed by `config::kHttpMaxSessions`.
+const WEB_TASK_POOL_SIZE: usize = http::MAX_SESSIONS;
+/// Connection sockets plus the DHCP server's UDP socket and the spare slot
+/// `embassy-net` reserves for DNS.
+const NET_SOCKETS: usize = WEB_TASK_POOL_SIZE + 2;
 const ETHERNET_MTU: usize = 1514;
 const HTTP_PORT: u16 = 80;
 const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 7, 1);
@@ -77,6 +87,10 @@ static AUTH_STACK: ConstStaticCell<CpuStack<AUTH_WORKER_STACK>> =
 esp_bootloader_esp_idf::esp_app_desc!();
 
 #[esp_hal::main]
+#[allow(
+    clippy::unwrap_used,
+    reason = "boot-time spawn failures are fatal; panicking resets the device"
+)]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     log::info!("[pm] boot v{}", pm_core::config::FIRMWARE_VERSION);
@@ -90,7 +104,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let mac6 = device::reversed_mac6();
     match mac6 {
-        Some(mac) => log::info!("device factor from MAC {:02x?}", mac),
+        Some(mac) => log::info!("device factor from MAC {mac:02x?}"),
         None => log::error!("device factor: eFuse MAC unreadable"),
     }
 
@@ -104,7 +118,7 @@ async fn main(spawner: Spawner) -> ! {
             let mut vault = Vault::new(store, mac);
             vault.initialize();
             let snap = vault.snapshot();
-            log::info!("vault: base={:#x} size={}", base, size);
+            log::info!("vault: base={base:#x} size={size}");
             log::info!(
                 "vault: state={}({}) provisioned={} entries={}",
                 snap.state.as_str(),
@@ -158,7 +172,6 @@ async fn main(spawner: Spawner) -> ! {
     let usb = Usb::new_fs(peripherals.USB_FS, peripherals.GPIO20, peripherals.GPIO19);
     log::info!("usb: otg full-speed initialized");
 
-    static EP_OUT_BUFFER: StaticCell<[u8; 1024]> = StaticCell::new();
     let driver = UsbDriver::new(usb, EP_OUT_BUFFER.init([0u8; 1024]), Config::default());
 
     // Device/config descriptor identity mirrors the reference in
@@ -171,10 +184,6 @@ async fn main(spawner: Spawner) -> ! {
     config.manufacturer = Some("PassManager");
     config.product = Some("PassManager NCM");
     config.serial_number = Some("");
-
-    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-    static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 
     let mut usb_builder = Builder::new(
         driver,
@@ -274,6 +283,10 @@ async fn usb_ncm_task(class: NcmRunner<'static, UsbDriver<'static>, ETHERNET_MTU
 }
 
 #[task]
+#[allow(
+    clippy::unwrap_used,
+    reason = "DHCP socket bind is boot-time; a failure is fatal"
+)]
 async fn run_dhcp(stack: Stack<'static>) {
     use edge_dhcp::{
         io::{self, DEFAULT_SERVER_PORT},
@@ -332,8 +345,10 @@ async fn web_task(
         .into_never()
 }
 
+/// Zero-sized picoserve app builder used to define [`AppRouter`].
 pub struct AppBuilder;
 
+/// Router type produced by [`AppBuilder`].
 pub type AppRouter = <AppBuilder as AppBuilderTrait>::PathRouter;
 
 impl AppBuilderTrait for AppBuilder {

@@ -9,11 +9,20 @@ use alloc::{format, string::String};
 use crate::config::{TOTP_DIGITS, TOTP_PERIOD_SEC, TOTP_SECRET_MAX};
 use crate::crypto::hmac_sha1;
 
+/// Errors from computing a TOTP code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TotpError {
     /// Secret is empty, too short, too long, or not valid base32.
     BadSecret,
 }
+
+impl core::fmt::Display for TotpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("invalid TOTP secret")
+    }
+}
+
+impl core::error::Error for TotpError {}
 
 /// Value of one base32 character (RFC 4648), or `None` if invalid.
 fn b32val(c: u8) -> Option<u8> {
@@ -114,7 +123,7 @@ mod tests {
             (2_000_000_000, "279037"),
         ];
         for (t, want) in vectors {
-            assert_eq!(compute(secret, *t).unwrap(), *want, "t={}", t);
+            assert_eq!(compute(secret, *t).unwrap(), *want, "t={t}");
         }
     }
 

@@ -17,6 +17,7 @@ use crate::crypto::hmac_sha256;
 /// Domain-separation label; length is fixed and part of the MACed message.
 pub const DEVICE_LABEL: &[u8] = b"pm-vault-device";
 
+/// Errors from deriving the device factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceError {
     /// `mac6` was all zero: the eFuse was not read, so there is no factor.
@@ -24,6 +25,17 @@ pub enum DeviceError {
     /// Salt is empty or longer than `PBKDF2_SALT_LEN`.
     BadSalt,
 }
+
+impl core::fmt::Display for DeviceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            DeviceError::NoMac => "device MAC not available",
+            DeviceError::BadSalt => "invalid device salt length",
+        })
+    }
+}
+
+impl core::error::Error for DeviceError {}
 
 /// Derives the device factor from the (already reversed) 6-byte MAC and salt.
 pub fn factor(mac6: &[u8; 6], salt_dev: &[u8]) -> Result<[u8; 32], DeviceError> {

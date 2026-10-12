@@ -2,7 +2,16 @@
 name = "pm-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Portable, host-testable core: PMV1 vault format, crypto, entries, PMX1 export"
+license = "MIT OR Apache-2.0"
+keywords = ["password-manager", "vault", "crypto", "no-std", "esp32"]
+categories = ["no-std", "cryptography", "embedded"]
+
+[features]
+default = []
+# Exposes `pm_core::testutil` (in-memory Storage) for integration tests.
+test-utils = []
 
 [lints]
 workspace = true

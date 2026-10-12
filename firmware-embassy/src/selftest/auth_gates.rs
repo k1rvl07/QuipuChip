@@ -165,10 +165,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
         let n = if ok { good.len() } else { 0 };
         ok = ok && n == config::MASTER_PASSWORD_CHARS;
 
-        let second_ok = auth
-            .poll(job)
-            .map(|v| v.password.is_empty())
-            .unwrap_or(false);
+        let second_ok = auth.poll(job).is_some_and(|v| v.password.is_empty());
         let detail = format!(
             "result {} len {}, second poll empty {}",
             res.as_str(),
@@ -192,7 +189,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
     };
 
     // The vault is now under `good`; vault gates open it with the same password.
-    *gate_pw = good.clone();
+    gate_pw.clone_from(&good);
 
     {
         auth.lock(vault);
@@ -208,10 +205,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
         // Session token: valid accepted, altered rejected, locked dead.
         let tok = auth.session_token_hex();
         let have_tok = tok.is_some();
-        let ok_tok = tok
-            .as_deref()
-            .map(|t| auth.session_valid(t))
-            .unwrap_or(false);
+        let ok_tok = tok.as_deref().is_some_and(|t| auth.session_valid(t));
         let bad = tok
             .as_deref()
             .map(|t| {
@@ -267,7 +261,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
         // Lockout: after AUTH_MAX_FAIL failures the correct password is refused.
         while auth.state().lockout_ms_left == 0 && auth.state().fail_count < config::AUTH_MAX_FAIL {
             let sub = auth.submit_unlock(GATE_PASSWORD_WRONG, &[]);
-            let _ = wait_job(auth, vault, sub);
+            drop(wait_job(auth, vault, sub));
         }
         let locked_job = auth.submit_unlock(&good, &[]);
         let lockout_held = locked_job.0 == NO_JOB && auth.state().lockout_ms_left > 0;
@@ -295,7 +289,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
         // Idle expiry: zero TTL closes the session.
         let sub = auth.submit_unlock(&good, &[]);
         let view = wait_job(auth, vault, sub);
-        let was_open = view.map(|v| v.result == JobResult::Ok).unwrap_or(false);
+        let was_open = view.is_some_and(|v| v.result == JobResult::Ok);
         auth.expire_idle_session(vault, 0);
         let idle_closed = was_open && !auth.state().unlocked;
         report(
@@ -317,8 +311,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
             }
             let sv1 = auth.poll(sjob);
             let sv2 = auth.poll(sjob);
-            let second_empty =
-                sjob != NO_JOB && sv2.map(|v| v.session_token.is_empty()).unwrap_or(false);
+            let second_empty = sjob != NO_JOB && sv2.is_some_and(|v| v.session_token.is_empty());
             let tok_usable = match &sv1 {
                 Some(v) => {
                     v.result == JobResult::Ok

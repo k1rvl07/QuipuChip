@@ -66,9 +66,13 @@ const _: () = assert!(HDR_SEQ + 4 <= HDR_CHECK);
 /// byte is the bitwise AND of the old and new values (bits can only go
 /// `1 -> 0`). `erase` sets the whole range to `0xFF`.
 pub trait Storage {
+    /// Total size of the backing device in bytes.
     fn size(&self) -> usize;
+    /// Reads exactly `buf.len()` bytes at `offset`.
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), VaultError>;
+    /// Writes `buf` at `offset` with flash semantics (bits only go `1 -> 0`).
     fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), VaultError>;
+    /// Sets `len` bytes at `offset` to `0xFF`; `offset`/`len` must be sector-aligned.
     fn erase(&mut self, offset: usize, len: usize) -> Result<(), VaultError>;
 }
 
@@ -110,6 +114,7 @@ enum SlotState {
     TagMismatch,
 }
 
+/// The PMV1 vault over a block device `S`.
 pub struct Vault<S: Storage> {
     storage: S,
     mac6: [u8; 6],
@@ -161,28 +166,39 @@ impl<S: Storage> Vault<S> {
         }
     }
 
+    /// Shared access to the backing device.
+    #[must_use]
     pub fn storage_ref(&self) -> &S {
         &self.storage
     }
 
+    /// Mutable access to the backing device.
     pub fn storage_mut(&mut self) -> &mut S {
         &mut self.storage
     }
 
     // ── Cheap state accessors ────────────────────────────────────────────────
 
+    /// Whether a header has been loaded or created (the vault is open).
+    #[must_use]
     pub fn initialized(&self) -> bool {
         self.ready
     }
 
+    /// Number of live entries.
+    #[must_use]
     pub fn count(&self) -> u32 {
         self.index.len() as u32
     }
 
+    /// Last cached state snapshot.
+    #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         self.snap
     }
 
+    /// Fresh counters derived from the current index.
+    #[must_use]
     pub fn stats(&self) -> Stats {
         Stats {
             entry_count: self.index.len() as u32,
@@ -201,11 +217,13 @@ impl<S: Storage> Vault<S> {
     }
 
     /// True when the partition holds a provisioned vault (flag in either slot).
+    #[must_use]
     pub fn provisioned(&self) -> bool {
         self.probe_provisioned()
     }
 
     /// True when the newest completed header carries the key-file flag.
+    #[must_use]
     pub fn key_file_required(&self) -> bool {
         self.probe_key_file_flag()
     }
@@ -285,6 +303,8 @@ impl<S: Storage> Vault<S> {
         self.hdr[HDR_MAGIC..HDR_MAGIC + 4].copy_from_slice(&VAULT_MAGIC);
         put32(&mut self.hdr[HDR_VERSION..], 1);
         put32(&mut self.hdr[HDR_GENERATION..], self.generation);
+        // invariant: counters are bounded by MAX_ENTRIES (1000) or the
+        // partition size (512 KiB), both far below u32::MAX.
         put32(&mut self.hdr[HDR_ENTRY_COUNT..], self.index.len() as u32);
         put32(&mut self.hdr[HDR_LIVE_BYTES..], self.live_payload as u32);
         put32(&mut self.hdr[HDR_USED_BYTES..], self.used_end as u32);
@@ -310,9 +330,8 @@ impl<S: Storage> Vault<S> {
         let aad = build_aad(&self.hdr);
         let nonce = nonce_for(self.generation, 0);
         let mut ct = [0u8; SENTINEL.len()];
-        let tag = match crypto::aes_gcm_encrypt(&self.key, &nonce, &aad, &mut ct) {
-            Ok(t) => t,
-            Err(_) => return false,
+        let Ok(tag) = crypto::aes_gcm_encrypt(&self.key, &nonce, &aad, &mut ct) else {
+            return false;
         };
         crypto::wipe(&mut ct);
         self.hdr[HDR_CHECK..HDR_CHECK + GCM_TAG_LEN].copy_from_slice(&tag);
@@ -355,41 +374,32 @@ impl<S: Storage> Vault<S> {
         }
 
         let mut trial = [0u8; AES_KEY_LEN];
-        match device::factor(
+        if let Ok(term) = device::factor(
             &self.mac6,
             &out[HDR_SALT_DEV..HDR_SALT_DEV + PBKDF2_SALT_LEN],
         ) {
-            Ok(term) => {
-                match crypto::pbkdf2_hmac_sha256(
-                    mat,
-                    &out[HDR_SALT_PW..HDR_SALT_PW + PBKDF2_SALT_LEN],
-                    iters,
-                ) {
-                    Ok(from_pw) => {
-                        for i in 0..AES_KEY_LEN {
-                            trial[i] = term[i] ^ from_pw[i];
-                        }
-                    }
-                    Err(_) => {
-                        trial[0] = 0;
-                        trial[1] = 0;
-                    }
+            if let Ok(from_pw) = crypto::pbkdf2_hmac_sha256(
+                mat,
+                &out[HDR_SALT_PW..HDR_SALT_PW + PBKDF2_SALT_LEN],
+                iters,
+            ) {
+                for i in 0..AES_KEY_LEN {
+                    trial[i] = term[i] ^ from_pw[i];
                 }
-            }
-            Err(_) => {
+            } else {
                 trial[0] = 0;
                 trial[1] = 0;
             }
+        } else {
+            trial[0] = 0;
+            trial[1] = 0;
         }
         let aad = build_aad(out);
         let nonce = nonce_for(generation, 0);
         let mut ct = [0u8; SENTINEL.len()];
-        let tag = match crypto::aes_gcm_encrypt(&trial, &nonce, &aad, &mut ct) {
-            Ok(t) => t,
-            Err(_) => {
-                crypto::wipe(&mut trial);
-                return SlotState::Invalid;
-            }
+        let Ok(tag) = crypto::aes_gcm_encrypt(&trial, &nonce, &aad, &mut ct) else {
+            crypto::wipe(&mut trial);
+            return SlotState::Invalid;
         };
         crypto::wipe(&mut ct);
         crypto::wipe(&mut trial);
@@ -410,6 +420,7 @@ impl<S: Storage> Vault<S> {
         }
         let mut rec = vec![0u8; total];
         put32(&mut rec[0..], raw_id);
+        // invariant: `len <= MAX_ENTRY_LEN` (1280) < u16::MAX, so lossless.
         put16(&mut rec[4..], len as u16);
         let nonce = nonce_for(self.generation, off);
         rec[6..6 + GCM_IV_LEN].copy_from_slice(&nonce);
@@ -423,12 +434,9 @@ impl<S: Storage> Vault<S> {
             body = SENTINEL[..1].to_vec();
             crypto::aes_gcm_encrypt(&self.key, &nonce, &aad, &mut body)
         };
-        let tag = match tag {
-            Ok(t) => t,
-            Err(_) => {
-                crypto::wipe(&mut rec);
-                return VaultError::Crypto;
-            }
+        let Ok(tag) = tag else {
+            crypto::wipe(&mut rec);
+            return VaultError::Crypto;
         };
         rec[REC_FIXED..REC_FIXED + body.len()].copy_from_slice(&body);
         rec[6 + GCM_IV_LEN..REC_FIXED].copy_from_slice(&tag);
@@ -719,6 +727,7 @@ impl<S: Storage> Vault<S> {
 
     // ── Session lifecycle ────────────────────────────────────────────────────
 
+    /// Wipes in-memory key material and marks the vault closed.
     pub fn close(&mut self) {
         crypto::wipe(&mut self.key);
         crypto::wipe(&mut self.hdr);
@@ -783,7 +792,7 @@ impl<S: Storage> Vault<S> {
             Some(m) => Secret::new(m),
             None => return VaultError::WrongPassword,
         };
-        self.key_file_flag = key_file.map(|k| !k.is_empty()).unwrap_or(false);
+        self.key_file_flag = key_file.is_some_and(|k| !k.is_empty());
 
         let mut raw = [0u8; VAULT_HEADER_BYTES];
         if self.storage.read(0, &mut raw).is_err() {
@@ -798,7 +807,7 @@ impl<S: Storage> Vault<S> {
             rng.fill(&mut self.salt_dev);
             let sp = self.salt_pw;
             let sd = self.salt_dev;
-            match derive_key(mat.as_slice(), &sp, &sd, PBKDF2_ITERS, &self.mac6) {
+            match derive_key(mat.as_slice(), &sp, &sd, PBKDF2_ITERS, self.mac6) {
                 Ok(k) => self.key = k,
                 Err(e) => return e,
             }
@@ -875,11 +884,7 @@ impl<S: Storage> Vault<S> {
         if self.data_start != region_start(0) && self.data_start != region_start(1) {
             return VaultError::Tampered;
         }
-        self.region = if self.data_start == region_start(1) {
-            1
-        } else {
-            0
-        };
+        self.region = usize::from(self.data_start == region_start(1));
         if self.used_end < self.data_start || self.used_end > region_start(2) {
             return VaultError::Tampered;
         }
@@ -891,7 +896,7 @@ impl<S: Storage> Vault<S> {
 
         let sp = self.salt_pw;
         let sd = self.salt_dev;
-        match derive_key(mat.as_slice(), &sp, &sd, self.iters, &self.mac6) {
+        match derive_key(mat.as_slice(), &sp, &sd, self.iters, self.mac6) {
             Ok(k) => self.key = k,
             Err(e) => {
                 crypto::wipe(&mut self.key);
@@ -934,6 +939,7 @@ impl<S: Storage> Vault<S> {
 
     // ── Entry operations ─────────────────────────────────────────────────────
 
+    /// Reads one entry by id.
     pub fn get(&self, id: u32) -> Result<Entry, VaultError> {
         if !self.ready {
             return Err(VaultError::BootStrap);
@@ -944,6 +950,7 @@ impl<S: Storage> Vault<S> {
         }
     }
 
+    /// Reads up to `max_count` entries.
     pub fn load(&self, max_count: usize) -> Result<Vec<Entry>, VaultError> {
         if !self.ready {
             return Err(VaultError::BootStrap);
@@ -958,6 +965,7 @@ impl<S: Storage> Vault<S> {
         Ok(out)
     }
 
+    /// Inserts or updates an entry, returning its id.
     pub fn add(&mut self, e: &Entry) -> Result<u32, VaultError> {
         if !self.ready {
             return Err(VaultError::BootStrap);
@@ -974,7 +982,7 @@ impl<S: Storage> Vault<S> {
         let id = if e.id != 0 { e.id } else { self.next_id };
         let at = self.find_index(id);
         let is_update = at.is_some();
-        let prev_len = at.map(|i| self.index[i].len as usize).unwrap_or(0);
+        let prev_len = at.map_or(0, |i| self.index[i].len as usize);
 
         if !is_update && self.index.len() as u32 >= MAX_ENTRIES {
             crypto::wipe(&mut buf);
@@ -1021,6 +1029,7 @@ impl<S: Storage> Vault<S> {
         Ok(id)
     }
 
+    /// Tombstones the entry with `id`; returns [`VaultError::NotFound`] if absent.
     pub fn remove(&mut self, id: u32) -> VaultError {
         if !self.ready {
             return VaultError::BootStrap;
@@ -1074,7 +1083,7 @@ impl<S: Storage> Vault<S> {
             Some(m) => Secret::new(m),
             None => return VaultError::WrongPassword,
         };
-        self.key_file_flag = key_file.map(|k| !k.is_empty()).unwrap_or(false);
+        self.key_file_flag = key_file.is_some_and(|k| !k.is_empty());
 
         let size = self.storage.size();
         if self.storage.erase(0, size).is_err() {
@@ -1097,7 +1106,7 @@ impl<S: Storage> Vault<S> {
         rng.fill(&mut self.salt_dev);
         let sp = self.salt_pw;
         let sd = self.salt_dev;
-        match derive_key(mat.as_slice(), &sp, &sd, self.iters, &self.mac6) {
+        match derive_key(mat.as_slice(), &sp, &sd, self.iters, self.mac6) {
             Ok(k) => self.key = k,
             Err(e) => return e,
         }
@@ -1126,7 +1135,7 @@ impl<S: Storage> Vault<S> {
             Some(m) => Secret::new(m),
             None => return VaultError::WrongPassword,
         };
-        let new_keyfile = key_file.map(|k| !k.is_empty()).unwrap_or(false);
+        let new_keyfile = key_file.is_some_and(|k| !k.is_empty());
 
         let saved = RekeySaved {
             old_data_start: self.data_start,
@@ -1157,7 +1166,7 @@ impl<S: Storage> Vault<S> {
         rng.fill(&mut self.salt_dev);
         let sp = self.salt_pw;
         let sd = self.salt_dev;
-        match derive_key(mat.as_slice(), &sp, &sd, self.iters, &self.mac6) {
+        match derive_key(mat.as_slice(), &sp, &sd, self.iters, self.mac6) {
             Ok(k) => self.key = k,
             Err(e) => {
                 self.rekey_restore(&saved, false);
@@ -1258,7 +1267,7 @@ impl<S: Storage> Vault<S> {
         self.used_end = saved.old_used_end;
         self.compacted_once = get32(&saved.old_hdr[HDR_FLAGS..]) & FLAG_COMPACTED != 0;
         self.hdr = saved.old_hdr;
-        self.index = saved.saved_index.clone();
+        self.index.clone_from(&saved.saved_index);
         self.live_payload = saved.saved_payload;
         self.next_id = saved.old_next_id;
     }
@@ -1397,11 +1406,11 @@ fn derive_key(
     salt_pw: &[u8],
     salt_dev: &[u8],
     iters: u32,
-    mac6: &[u8; 6],
+    mac6: [u8; 6],
 ) -> Result<[u8; AES_KEY_LEN], VaultError> {
     let from_pw =
         crypto::pbkdf2_hmac_sha256(mat, salt_pw, iters).map_err(|_| VaultError::Crypto)?;
-    let term = device::factor(mac6, salt_dev).map_err(|_| VaultError::Crypto)?;
+    let term = device::factor(&mac6, salt_dev).map_err(|_| VaultError::Crypto)?;
     let mut key = [0u8; AES_KEY_LEN];
     for i in 0..AES_KEY_LEN {
         key[i] = from_pw[i] ^ term[i];

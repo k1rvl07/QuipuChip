@@ -52,8 +52,7 @@ pub(super) fn keyfile_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate
         if polled && res == JobResult::Ok {
             get_ok = vault
                 .get(probe_id)
-                .map(|got| got.get(Field::Title) == b"gate-keyfile")
-                .unwrap_or(false);
+                .is_ok_and(|got| got.get(Field::Title) == b"gate-keyfile");
         }
         let detail = format!(
             "unlock {}, entry {}",

@@ -20,15 +20,40 @@ pub use crate::config::{AES_KEY_LEN, GCM_IV_LEN, GCM_TAG_LEN};
 /// Mirrors `crypto::CipherError` from the C++ reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CipherError {
+    /// No error.
     Ok,
+    /// A parameter was rejected as invalid.
     InvalidArg,
+    /// The key length was wrong.
     InvalidKeyLen,
+    /// The IV/nonce length was wrong.
     InvalidIvLen,
+    /// The tag length was wrong.
     InvalidTagLen,
+    /// Authentication tag verification failed.
     AuthFail,
+    /// Encryption failed.
     EncryptFail,
+    /// Decryption failed.
     DecryptFail,
 }
+
+impl core::fmt::Display for CipherError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            CipherError::Ok => "ok",
+            CipherError::InvalidArg => "invalid argument",
+            CipherError::InvalidKeyLen => "invalid key length",
+            CipherError::InvalidIvLen => "invalid iv length",
+            CipherError::InvalidTagLen => "invalid tag length",
+            CipherError::AuthFail => "authentication failed",
+            CipherError::EncryptFail => "encrypt failed",
+            CipherError::DecryptFail => "decrypt failed",
+        })
+    }
+}
+
+impl core::error::Error for CipherError {}
 
 /// Best-effort secure zeroing that the compiler may not elide.
 pub fn wipe(buf: &mut [u8]) {
@@ -39,11 +64,13 @@ pub fn wipe(buf: &mut [u8]) {
 }
 
 /// Constant-time comparison. Lengths are part of the compared data.
+#[must_use]
 pub fn ct_equal(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).unwrap_u8() == 1
 }
 
 /// SHA-256 of one buffer.
+#[must_use]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(data));
@@ -51,6 +78,8 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// HMAC-SHA256 (any key length).
+#[must_use]
+#[allow(clippy::expect_used, reason = "HMAC accepts a key of any length")]
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -60,6 +89,8 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 /// HMAC-SHA1 (TOTP only, RFC 6238).
+#[must_use]
+#[allow(clippy::expect_used, reason = "HMAC accepts a key of any length")]
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -213,13 +244,7 @@ mod tests {
         ];
         for (pass, salt, iters, expect) in vectors {
             let got = pbkdf2_hmac_sha256(pass, salt, *iters).unwrap();
-            assert_eq!(
-                got.to_vec(),
-                unhex(expect),
-                "pass={:?} iters={}",
-                pass,
-                iters
-            );
+            assert_eq!(got.to_vec(), unhex(expect), "pass={pass:?} iters={iters}");
         }
     }
 

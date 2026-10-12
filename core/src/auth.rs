@@ -29,16 +29,24 @@ use crate::vault::{Storage, Vault};
 /// Length of the session token as it travels on the wire: 32 bytes in hex.
 pub const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_LEN * 2;
 
-/// What to ask the worker to do. Discriminants land in the log.
+/// What to ask the worker to do. Discriminants land in the log, so the
+/// representation is fixed to `u8` rather than the default `isize`.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
+    /// Create a fresh vault and its master password.
     Provision = 0,
+    /// Unlock an existing vault with a password.
     Unlock = 1,
+    /// Wipe the vault and return to the unprovisioned state.
     Reset = 2,
+    /// Re-encrypt the vault under a new password/key file.
     Rekey = 3,
 }
 
 impl Job {
+    /// Wire/log wording of the job kind.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Job::Provision => "provision",
@@ -49,20 +57,35 @@ impl Job {
     }
 }
 
+impl core::fmt::Display for Job {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
 /// Outcome of an operation. `Pending` and `Busy` are not errors.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobResult {
+    /// Accepted but not finished yet.
     Pending = 0,
+    /// Finished successfully.
     Ok = 1,
+    /// The supplied password was rejected.
     WrongPassword = 2,
+    /// Refused because the vault is in the wrong state for this job.
     Refused = 3,
+    /// Refused because of the failure lockout.
     Lockout = 4,
+    /// Rejected because another job is in flight.
     Busy = 5,
+    /// Failed for an internal reason.
     Error = 6,
 }
 
 impl JobResult {
-    /// Mirrors `auth::toString`.
+    /// Wire/log wording of the outcome.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             JobResult::Pending => "pending",
@@ -76,28 +99,47 @@ impl JobResult {
     }
 }
 
+impl core::fmt::Display for JobResult {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
 /// Fate of the key file during a rekey.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyfileAction {
+    /// Keep the existing key file.
     Keep = 0,
+    /// Replace the key file with a new one.
     Set = 1,
+    /// Remove the key file.
     Clear = 2,
 }
 
+impl core::fmt::Display for KeyfileAction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            KeyfileAction::Keep => "keep",
+            KeyfileAction::Set => "set",
+            KeyfileAction::Clear => "clear",
+        })
+    }
+}
+
 /// A queued request. Owns its secrets; dropping it wipes them.
+///
+/// Opaque outside the crate: callers only ever receive it from a `submit*`
+/// method and hand it back to [`Auth::run`].
 pub struct Request {
-    pub kind: Job,
-    pub id: JobId,
-    /// New master password (rekey) or the unlock password.
-    pub password: Vec<u8>,
-    /// Current master password; rekey only.
-    pub old_password: Vec<u8>,
-    /// Raw key file bytes (never base64) for the KDF.
-    pub key_file: Vec<u8>,
-    /// New key file, rekey + `Set` only.
-    pub key_file_new: Vec<u8>,
-    pub keyfile_action: KeyfileAction,
-    pub has_new_password: bool,
+    kind: Job,
+    id: JobId,
+    password: Vec<u8>,
+    old_password: Vec<u8>,
+    key_file: Vec<u8>,
+    key_file_new: Vec<u8>,
+    keyfile_action: KeyfileAction,
+    has_new_password: bool,
 }
 
 impl Request {
@@ -127,18 +169,27 @@ impl Drop for Request {
 /// Snapshot for `GET /api/auth/state`. Cheap: reads cached fields only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct State {
+    /// Whether a vault has been provisioned.
     pub provisioned: bool,
+    /// Whether the vault is currently unlocked.
     pub unlocked: bool,
+    /// Whether a job is in flight.
     pub busy: bool,
+    /// Consecutive failed unlock attempts.
     pub fail_count: u8,
+    /// Remaining lockout time in milliseconds.
     pub lockout_ms_left: u32,
 }
 
 /// Result of a job handed to `poll()`.
 pub struct JobView {
+    /// Which operation finished.
     pub kind: Job,
+    /// Its outcome.
     pub result: JobResult,
+    /// One-shot provisioning password, if any.
     pub password: Vec<u8>,
+    /// One-shot session token (hex ASCII), if any.
     pub session_token: Vec<u8>,
 }
 
@@ -155,11 +206,13 @@ impl Drop for JobView {
 /// `/api/auth/job/{id}` until a session exists, and that route hands out the
 /// one-shot provisioning password.
 pub type JobId = u64;
+/// Sentinel id meaning "no job accepted".
 pub const NO_JOB: JobId = 0;
 
 /// Time source. Injected so tests can move the clock (and cross the 49.7-day
 /// `millis()` wrap).
 pub trait Clock {
+    /// Milliseconds since boot, wrapping every 49.7 days.
     fn now_ms(&self) -> u32;
 }
 
@@ -168,12 +221,15 @@ pub trait Clock {
 pub struct ManualClock(Rc<Cell<u32>>);
 
 impl ManualClock {
+    /// Creates a clock reading `now_ms`.
     pub fn new(now_ms: u32) -> Self {
         Self(Rc::new(Cell::new(now_ms)))
     }
+    /// Sets the clock to `now_ms`.
     pub fn set(&self, now_ms: u32) {
         self.0.set(now_ms);
     }
+    /// Advances the clock by `delta_ms` (wrapping).
     pub fn advance(&self, delta_ms: u32) {
         self.0.set(self.0.get().wrapping_add(delta_ms));
     }
@@ -229,6 +285,7 @@ pub struct Auth<R: RandomSource, C: Clock> {
 pub type Submit = (JobId, Option<Request>);
 
 impl<R: RandomSource, C: Clock> Auth<R, C> {
+    /// Creates the state machine with the given randomness and clock sources.
     pub fn new(rng: R, clock: C) -> Self {
         Self {
             rng,
@@ -370,6 +427,10 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "generated password is ASCII by construction"
+    )]
     fn run_provision<S: Storage>(&mut self, vault: &mut Vault<S>, req: &Request) {
         // Re-checked here, not only in submit: another job's result may have
         // appeared in between, and wiping a provisioned vault is data loss.
@@ -552,6 +613,8 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         })
     }
 
+    #[must_use]
+    /// Cached snapshot for `GET /api/auth/state`.
     pub fn state(&self) -> State {
         State {
             provisioned: self.provisioned,
@@ -607,6 +670,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
 
     /// Validates `X-PM-Session`. Constant-time compare: an early exit would
     /// leak the length of a matching prefix.
+    #[must_use]
     pub fn session_valid(&self, token_hex: &str) -> bool {
         if token_hex.len() != SESSION_TOKEN_HEX_LEN || !self.unlocked || self.token_all_zero() {
             return false;
@@ -643,6 +707,8 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
 
     /// Generates a master password. Public because its format is a user-facing
     /// contract that selftest validates independently of provisioning.
+    #[must_use]
+    #[allow(clippy::expect_used, reason = "generator emits ASCII by construction")]
     pub fn generate_master_password(&mut self) -> String {
         let bytes = generate_password(&mut self.rng);
         String::from_utf8(bytes.to_vec()).expect("password is ASCII by construction")

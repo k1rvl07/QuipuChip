@@ -17,5 +17,7 @@ pub const KDF_PARAMS_LEN: usize = 4 + 4 + 1 + PBKDF2_SALT_LEN;
 
 /// TOTP (RFC 6238): SHA1, 6 digits, 30 s, base32 secret string.
 pub const TOTP_SECRET_MAX: usize = 64;
+/// Number of digits in a generated TOTP code.
 pub const TOTP_DIGITS: u32 = 6;
+/// TOTP time-step length in seconds.
 pub const TOTP_PERIOD_SEC: u64 = 30;

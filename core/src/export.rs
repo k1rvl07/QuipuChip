@@ -47,12 +47,19 @@ const _: () = {
 /// serde emits and matches the C++ insertion order exactly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pmx1Entry {
+    /// Entry title.
     pub title: String,
+    /// Login/username.
     pub login: String,
+    /// Password or secret.
     pub password: String,
+    /// URL.
     pub url: String,
+    /// Free-form note.
     pub note: String,
+    /// Space-separated tags.
     pub tags: String,
+    /// TOTP secret (base32).
     pub totp: String,
 }
 
@@ -60,6 +67,7 @@ impl Pmx1Entry {
     /// Reads a vault record into an export entry. Stored strings are UTF-8 by
     /// construction; undecodable bytes (flash corruption) are replaced rather
     /// than dropped.
+    #[must_use]
     pub fn from_entry(e: &Entry) -> Self {
         let s = |f: Field| String::from_utf8_lossy(e.get(f)).into_owned();
         Self {
@@ -77,6 +85,7 @@ impl Pmx1Entry {
     /// truncated to the field capacity by [`Entry::set`]; callers that need to
     /// reject oversize values must check first (the import path does, via
     /// [`parse_import`]).
+    #[must_use]
     pub fn into_entry(&self) -> Entry {
         let mut e = Entry::new();
         e.set(Field::Title, self.title.as_bytes());
@@ -91,10 +100,10 @@ impl Pmx1Entry {
 }
 
 /// Opening bytes of a streamed export up to and including `"entries":[`.
+#[must_use]
 pub fn export_head(count: usize) -> String {
     format!(
-        "{{\"ok\":true,\"format\":\"{}\",\"version\":{},\"count\":{},\"entries\":[",
-        FORMAT, EXPORT_VERSION, count
+        "{{\"ok\":true,\"format\":\"{FORMAT}\",\"version\":{EXPORT_VERSION},\"count\":{count},\"entries\":["
     )
 }
 
@@ -102,11 +111,14 @@ pub fn export_head(count: usize) -> String {
 pub const EXPORT_TAIL: &str = "]}";
 
 /// Serializes one record. Never fails for values produced by [`Pmx1Entry`].
+#[must_use]
+#[allow(clippy::expect_used, reason = "Pmx1Entry is all strings, cannot fail")]
 pub fn encode_entry(e: &Entry) -> String {
     serde_json::to_string(&Pmx1Entry::from_entry(e)).expect("PMX1 entry serializes")
 }
 
 /// Whole export document, for tests and limited exports.
+#[must_use]
 pub fn export_document(entries: &[Entry]) -> String {
     let mut out = export_head(entries.len());
     for (i, e) in entries.iter().enumerate() {
@@ -123,17 +135,27 @@ pub fn export_document(entries: &[Entry]) -> String {
 /// C++ handler returns, so the HTTP layer stays byte-compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportError {
+    /// The `format` field is missing.
     FormatRequired,
+    /// The `version` field is not supported.
     VersionUnsupported,
+    /// The `entries` array is missing.
     EntriesRequired,
+    /// The document contained no importable entries.
     NothingToImport,
+    /// The batch exceeds the per-request entry limit.
     BatchTooLarge,
+    /// An entry was not a JSON object.
     EntryNotAnObject,
+    /// A field was too long or not a string.
     FieldTooLongOrNotString,
+    /// A `totp` value was not a valid base32 secret.
     TotpSecretInvalid,
 }
 
 impl ImportError {
+    /// Wire code the HTTP layer returns for this refusal.
+    #[must_use]
     pub fn code(self) -> &'static str {
         match self {
             ImportError::FormatRequired => "format_required",
@@ -147,6 +169,14 @@ impl ImportError {
         }
     }
 }
+
+impl core::fmt::Display for ImportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl core::error::Error for ImportError {}
 
 /// Parses and fully validates one import batch. On success the returned records
 /// are ready for `Vault::add` (ids are zero). Any error rejects the batch before

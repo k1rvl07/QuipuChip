@@ -1,0 +1,4 @@
+# See the root clippy.toml: restriction lints are enforced outside tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

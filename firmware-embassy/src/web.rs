@@ -47,31 +47,30 @@ pub fn open(rel: &str) -> Option<Asset> {
     None
 }
 
+const MIMES: &[(&str, &str)] = &[
+    ("html", "text/html; charset=utf-8"),
+    ("htm", "text/html; charset=utf-8"),
+    ("js", "application/javascript; charset=utf-8"),
+    ("mjs", "application/javascript; charset=utf-8"),
+    ("css", "text/css; charset=utf-8"),
+    ("json", "application/json"),
+    ("svg", "image/svg+xml"),
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("ico", "image/vnd.microsoft.icon"),
+    ("woff2", "font/woff2"),
+    ("woff", "font/woff"),
+    ("txt", "text/plain; charset=utf-8"),
+    ("map", "application/json"),
+];
+
 /// Maps a normalized path to its Content-Type, by extension.
 pub fn mime_for(path: &str) -> &'static str {
-    let ext = match path.rsplit_once('.') {
-        Some((_, ext)) => ext,
-        None => return OCTET_STREAM,
+    let Some((_, ext)) = path.rsplit_once('.') else {
+        return OCTET_STREAM;
     };
-
-    const MIMES: &[(&str, &str)] = &[
-        ("html", "text/html; charset=utf-8"),
-        ("htm", "text/html; charset=utf-8"),
-        ("js", "application/javascript; charset=utf-8"),
-        ("mjs", "application/javascript; charset=utf-8"),
-        ("css", "text/css; charset=utf-8"),
-        ("json", "application/json"),
-        ("svg", "image/svg+xml"),
-        ("png", "image/png"),
-        ("jpg", "image/jpeg"),
-        ("jpeg", "image/jpeg"),
-        ("gif", "image/gif"),
-        ("ico", "image/vnd.microsoft.icon"),
-        ("woff2", "font/woff2"),
-        ("woff", "font/woff"),
-        ("txt", "text/plain; charset=utf-8"),
-        ("map", "application/json"),
-    ];
 
     for (name, ty) in MIMES {
         if ext.eq_ignore_ascii_case(name) {

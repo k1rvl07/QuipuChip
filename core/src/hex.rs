@@ -3,6 +3,7 @@
 use alloc::string::String;
 
 /// Encodes `bytes` as lowercase hex (two chars per byte).
+#[must_use]
 pub fn encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -27,18 +28,17 @@ pub fn nibble(c: u8) -> Option<u8> {
 ///
 /// Returns `false` on a length mismatch or any non-hex digit; `out` is then
 /// partially written and must be ignored by the caller.
+#[must_use]
 pub fn decode_into(hex: &[u8], out: &mut [u8]) -> bool {
     if hex.len() != out.len() * 2 {
         return false;
     }
     for (i, byte) in out.iter_mut().enumerate() {
-        let hi = match nibble(hex[i * 2]) {
-            Some(v) => v,
-            None => return false,
+        let Some(hi) = nibble(hex[i * 2]) else {
+            return false;
         };
-        let lo = match nibble(hex[i * 2 + 1]) {
-            Some(v) => v,
-            None => return false,
+        let Some(lo) = nibble(hex[i * 2 + 1]) else {
+            return false;
         };
         *byte = (hi << 4) | lo;
     }

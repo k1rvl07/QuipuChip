@@ -94,9 +94,9 @@ enum Reply {
 
 /// Result of an import batch: how many records landed and the first error that
 /// stopped it (if any). Records already added are kept — no rollback.
-pub struct ImportOutcome {
-    pub added: u32,
-    pub error: Option<VaultError>,
+pub(crate) struct ImportOutcome {
+    pub(crate) added: u32,
+    pub(crate) error: Option<VaultError>,
 }
 
 // ── Lock-free snapshot read by the HTTP layer ────────────────────────────────
@@ -253,19 +253,19 @@ async fn handle(auth: &mut WorkerAuth, vault: &mut WorkerVault, cmd: Command) {
         Command::Lock => {
             auth.lock(vault);
             publish(auth, vault);
-            let _ = REPLY.send(Reply::Lock(true)).await;
+            REPLY.send(Reply::Lock(true)).await;
         }
         Command::GeneratePassword => {
             let pw = auth.generate_master_password();
-            let _ = REPLY.send(Reply::Password(pw)).await;
+            REPLY.send(Reply::Password(pw)).await;
         }
         Command::EntriesList => {
             let res = vault.load(MAX_ENTRIES as usize);
-            let _ = REPLY.send(Reply::Entries(res)).await;
+            REPLY.send(Reply::Entries(res)).await;
         }
         Command::EntryGet { id } => {
             let res = vault.get(id).map(Box::new);
-            let _ = REPLY.send(Reply::Entry(res)).await;
+            REPLY.send(Reply::Entry(res)).await;
         }
         Command::EntryWrite { id, mut entry } => {
             // Update merges the stored password when the request omits it, so a
@@ -284,7 +284,7 @@ async fn handle(auth: &mut WorkerAuth, vault: &mut WorkerVault, cmd: Command) {
                 vault.add(&entry)
             };
             publish(auth, vault);
-            let _ = REPLY.send(Reply::Id(res)).await;
+            REPLY.send(Reply::Id(res)).await;
         }
         Command::EntryRemove { id } => {
             let res = match vault.remove(id) {
@@ -292,7 +292,7 @@ async fn handle(auth: &mut WorkerAuth, vault: &mut WorkerVault, cmd: Command) {
                 e => Err(e),
             };
             publish(auth, vault);
-            let _ = REPLY.send(Reply::Removed(res)).await;
+            REPLY.send(Reply::Removed(res)).await;
         }
         Command::ImportBatch { entries } => {
             let mut added = 0u32;
@@ -307,7 +307,7 @@ async fn handle(auth: &mut WorkerAuth, vault: &mut WorkerVault, cmd: Command) {
                 }
             }
             publish(auth, vault);
-            let _ = REPLY
+            REPLY
                 .send(Reply::Import(ImportOutcome { added, error }))
                 .await;
         }
@@ -320,7 +320,7 @@ async fn begin(auth: &mut WorkerAuth, vault: &mut WorkerVault, id: JobId, kind: 
         SHARED.job.lock(|j| j.borrow_mut().begin(id, kind));
     }
     publish(auth, vault);
-    let _ = REPLY.send(Reply::Job(id)).await;
+    REPLY.send(Reply::Job(id)).await;
 }
 
 fn run_and_finish(
@@ -336,7 +336,7 @@ fn run_and_finish(
             let token = view.session_token.clone();
             SHARED.job.lock(|j| {
                 j.borrow_mut()
-                    .complete(view.kind, view.result, password, token)
+                    .complete(view.kind, view.result, password, token);
             });
         }
     }
@@ -421,10 +421,10 @@ pub async fn entry_get(id: u32) -> Result<Box<Entry>, VaultError> {
     }
 }
 
-pub async fn entry_write(id: u32, entry: Entry) -> Result<u32, VaultError> {
+pub async fn entry_write(id: u32, entry: &Entry) -> Result<u32, VaultError> {
     match round_trip(Command::EntryWrite {
         id,
-        entry: Box::new(entry),
+        entry: Box::new(*entry),
     })
     .await
     {
@@ -453,7 +453,8 @@ pub async fn import_batch(entries: Vec<Entry>) -> ImportOutcome {
 /// Wake-up used by the core-0 idle tick. Never blocks: a full channel means the
 /// worker is busy and the tick is simply skipped.
 pub fn tick() {
-    let _ = CMD.try_send(Command::Tick);
+    // A full channel means the worker is busy; the tick is simply skipped.
+    drop(CMD.try_send(Command::Tick));
 }
 
 /// Lock-free snapshot for `GET /api/auth/state`.
@@ -514,11 +515,11 @@ pub fn session_token_hex() -> Option<String> {
 
 /// A polling response. Wipes its secrets on drop; the caller consumes them
 /// first.
-pub struct PolledJob {
-    pub kind: Job,
-    pub result: JobResult,
-    pub password: Vec<u8>,
-    pub session_token: Vec<u8>,
+pub(crate) struct PolledJob {
+    pub(crate) kind: Job,
+    pub(crate) result: JobResult,
+    pub(crate) password: Vec<u8>,
+    pub(crate) session_token: Vec<u8>,
 }
 
 impl Drop for PolledJob {

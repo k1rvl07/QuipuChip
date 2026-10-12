@@ -18,6 +18,7 @@ use crate::rand::RandomSource;
 use crate::wordlist::word;
 
 /// Uniform word index in `0..4096` from four random bytes (little-endian).
+#[must_use]
 pub fn random_word_index(src: &mut impl RandomSource) -> usize {
     let mut b = [0u8; 4];
     src.fill(&mut b);
@@ -27,6 +28,7 @@ pub fn random_word_index(src: &mut impl RandomSource) -> usize {
 
 /// Uniform digit `0..=9`. After `MAX_DIGIT_ATTEMPTS` rejections, falls back to
 /// the last rejected byte (biased, but an explicit refusal to spin forever).
+#[must_use]
 pub fn next_digit(src: &mut impl RandomSource) -> u8 {
     let mut b = [0u8; 1];
     let mut last = 0u8;
@@ -42,6 +44,7 @@ pub fn next_digit(src: &mut impl RandomSource) -> u8 {
 
 /// Builds a master password. The length is fixed by construction, so the C++
 /// "layout broke" guard becomes a debug assertion here.
+#[must_use]
 pub fn generate_password(src: &mut impl RandomSource) -> [u8; MASTER_PASSWORD_CHARS] {
     let mut out = [0u8; MASTER_PASSWORD_CHARS];
     let mut n = 0usize;
@@ -65,6 +68,8 @@ pub fn generate_password(src: &mut impl RandomSource) -> [u8; MASTER_PASSWORD_CH
 }
 
 /// Convenience wrapper returning the password as a `String`.
+#[must_use]
+#[allow(clippy::expect_used, reason = "generator emits ASCII by construction")]
 pub fn generate_password_string(src: &mut impl RandomSource) -> String {
     let bytes = generate_password(src);
     String::from_utf8(bytes.to_vec()).expect("password is ASCII by construction")
