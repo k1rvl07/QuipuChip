@@ -934,6 +934,15 @@ async fn unlock<R: Read>(
 ) -> Result<Outcome, HttpError> {
     require_same_origin(parts)?;
 
+    // Refuse before the body: unlocking a vault that was never provisioned is
+    // a client mistake, not a password check. Running the KDF against an empty
+    // partition would burn the full PBKDF2 time and then fail with a vague 500.
+    let s = authsvc::state();
+    if !s.provisioned {
+        log::warn!("http: unlock refused, unprovisioned");
+        return Err(conflict("unprovisioned"));
+    }
+
     let doc = read_json_body(parts, body).await?;
     let Some(password) = doc.get("password").and_then(Value::as_str) else {
         return Err(bad_request("password_required"));
@@ -989,6 +998,11 @@ fn job_poll(path: &str) -> Result<Outcome, HttpError> {
 async fn lock(parts: RequestParts<'_>) -> Result<Outcome, HttpError> {
     require_same_origin(parts)?;
     require_session(parts)?;
+    // A session implies an unlocked vault, so this defends against future
+    // session-semantics drift rather than today's reachable states.
+    if !authsvc::state().unlocked {
+        return Err(conflict("not_unlocked"));
+    }
     if !authsvc::lock().await {
         return Err(internal("lock_failed"));
     }
@@ -1023,8 +1037,11 @@ async fn reset<R: Read>(
     body: &mut RequestBodyConnection<'_, R>,
 ) -> Result<Outcome, HttpError> {
     require_same_origin(parts)?;
-    // Session mandatory by design: reset destroys the vault.
-    require_session(parts)?;
+    // Reset is deliberately *not* session-gated: the owner needs a factory
+    // reset to work from the locked screen (e.g. a forgotten master password
+    // makes a valid session unreachable by design). The remaining barriers are
+    // the explicit RESET confirmation and the busy gate. Accepted trade-off:
+    // any process with USB/HTTP access to the device can wipe the vault.
 
     let doc = read_json_body(parts, body).await?;
     if doc.get("confirm").and_then(Value::as_str) != Some("RESET") {
@@ -1046,6 +1063,11 @@ async fn rekey<R: Read>(
 ) -> Result<Outcome, HttpError> {
     require_same_origin(parts)?;
     require_session(parts)?;
+    // A session implies an unlocked vault; kept explicit so the route reads as
+    // "re-encrypt an open vault", whatever future session changes do.
+    if !authsvc::state().unlocked {
+        return Err(conflict("not_unlocked"));
+    }
 
     let doc = read_json_body(parts, body).await?;
     let Some(old) = doc.get("old_password").and_then(Value::as_str) else {

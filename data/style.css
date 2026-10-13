@@ -24,6 +24,13 @@
   box-sizing: border-box;
 }
 
+/* Атрибут hidden обязан побеждать display из селекторов ниже (шапка, .btn):
+   авторский display перебивает UA-правило [hidden], поэтому без !important
+   element с атрибутом остался бы видимым. */
+[hidden] {
+  display: none !important;
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -295,11 +302,10 @@ html, body {
   letter-spacing: 0.02em;
 }
 
-.input--password {
-  resize: vertical;
-  min-height: 5.25rem;
+.input--output {
   text-align: center;
-  line-height: 1.8;
+  font-size: 1rem;
+  letter-spacing: 0.04em;
 }
 
 .input--search {

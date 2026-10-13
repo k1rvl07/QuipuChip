@@ -327,8 +327,13 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         self.enqueue(req)
     }
 
-    /// Orders an unlock. Refused when a lockout is in effect.
+    /// Orders an unlock. Refused when a lockout is in effect or when there is
+    /// no vault to unlock: running the KDF against an empty partition would
+    /// waste seconds and then fail with a meaningless error.
     pub fn submit_unlock(&mut self, password: &str, key_file: &[u8]) -> Submit {
+        if !self.provisioned {
+            return (NO_JOB, None);
+        }
         if self.lockout_left_ms() > 0 {
             return (NO_JOB, None);
         }
@@ -471,6 +476,13 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
     fn run_unlock<S: Storage>(&mut self, vault: &mut Vault<S>, req: &Request) {
         if self.lockout_left_ms() > 0 {
             self.publish_result(req.id, Job::Unlock, JobResult::Lockout);
+            return;
+        }
+        // Re-checked here, not only in submit: a reset may have wiped the
+        // vault between submit and run, and a fresh provision would be a
+        // different vault with a different key.
+        if !vault.provisioned() {
+            self.publish_result(req.id, Job::Unlock, JobResult::Refused);
             return;
         }
 
@@ -885,6 +897,38 @@ mod tests {
         let st = a.state();
         assert!(!st.provisioned && !st.unlocked);
         assert!(a.session_token_hex().is_none());
+    }
+
+    #[test]
+    fn unlock_refused_when_unprovisioned() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let v = vault();
+        a.initialize(&v);
+
+        let (id, _req) = a.submit_unlock("any password", &[]);
+        assert_eq!(
+            id, NO_JOB,
+            "unlock on an empty vault must be refused up-front"
+        );
+    }
+
+    #[test]
+    fn unlock_refused_when_vault_reset_underneath() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let pw = provision(&mut a, &mut v);
+
+        let (id, req) = a.submit_unlock(&pw, &[]);
+        assert_ne!(id, NO_JOB);
+
+        // The vault becomes unprovisioned between submit and run (e.g. a
+        // concurrent reset): the worker must refuse, not run a KDF.
+        assert_eq!(v.reset(), VaultError::None);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Refused);
     }
 
     #[test]

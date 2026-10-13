@@ -34,6 +34,8 @@
     busy: 'Устройство занято другой операцией',
     refused: 'Операция отклонена устройством',
     already_provisioned: 'Хранилище уже настроено',
+    unprovisioned: 'Хранилище ещё не настроено',
+    not_unlocked: 'Хранилище заблокировано',
     keyfile_invalid_base64: 'Некорректный файл ключа',
     keyfile_too_large: 'Файл ключа больше 4096 байт',
     keyfile_not_a_string: 'Ошибка чтения файла ключа',
@@ -108,8 +110,7 @@
       path === '/api/auth/session' ||
       path === '/api/auth/lock' ||
       path === '/api/auth/password' ||
-      path === '/api/auth/rekey' ||
-      path === '/api/auth/reset'
+      path === '/api/auth/rekey'
     );
   }
 
@@ -244,7 +245,8 @@
     el('screenSetup').hidden = name !== 'setup';
     el('screenUnlock').hidden = name !== 'unlock';
     el('screenApp').hidden = name !== 'app';
-    el('headerControls').hidden = name !== 'app';
+    el('headerControls').hidden =
+      !(name === 'app' && state.provisioned && state.unlocked);
     if (name !== 'unlock') {
       stopLockoutTimer();
     }
@@ -491,6 +493,11 @@
       const res = await submitJob('/api/auth/provision', body);
       state.masterShown = res.password || '';
       state.keyfileRequired = !kf.absent;
+      // Provision succeeded and submitJob already saved the session token, so
+      // the client state is unlocked here: the header controls and the footer
+      // must show an open vault without a page reload.
+      state.provisioned = true;
+      state.unlocked = true;
       el('masterPassword').value = state.masterShown;
       el('masterLen').textContent = String(state.masterShown.length);
       el('masterBlock').hidden = false;
@@ -982,6 +989,13 @@
     return imported;
   }
 
+  function openResetModal() {
+    el('inputResetConfirm').value = '';
+    el('btnResetConfirm').disabled = true;
+    hideStatus(el('resetStatus'));
+    el('modalReset').showModal();
+  }
+
   async function doReset(e) {
     if (e) {
       e.preventDefault();
@@ -993,20 +1007,21 @@
     try {
       await submitJob('/api/auth/reset', { confirm: 'RESET' });
       saveSession('');
-      el('inputResetConfirm').value = '';
-      el('modalReset').close();
+      // A reset returns the vault to the first-run state; drop every piece of
+      // in-memory app state so the setup screen shows no leftovers.
+      state.entries = [];
+      state.editingId = null;
+      state.viewId = null;
+      state.masterShown = '';
+      if (el('modalReset').open) {
+        el('modalReset').close();
+      }
       await fetchState();
       showScreen('setup');
       updateFooter();
       statusOf(el('setupStatus'), 'ok', 'Устройство сброшено. Создайте новое хранилище.');
     } catch (err) {
-      // session_required уже отработал через handleSessionExpired(): модалка
-      // закрыта, сообщение показано на экране разблокировки — дублировать его
-      // в закрытой модалке не нужно.
-      if (err.code !== 'session_required') {
-        statusOf(st, 'error', errMsg(err.code));
-      }
-      btn.disabled = el('inputResetConfirm').value !== 'RESET';
+      statusOf(st, 'error', errMsg(err.code));
     } finally {
       if (el('modalReset').open) {
         btn.disabled = el('inputResetConfirm').value !== 'RESET';
@@ -1347,6 +1362,9 @@
       el('masterBlock').hidden = true;
       state.masterShown = '';
       el('masterPassword').value = '';
+      // Source of truth: re-sync the published state so the app screen (and the
+      // header controls) open immediately instead of after a reload.
+      await fetchState().catch(() => {});
       await enterApp();
     });
 
@@ -1451,10 +1469,11 @@
     });
 
     el('btnReset').addEventListener('click', () => {
-      el('inputResetConfirm').value = '';
-      el('btnResetConfirm').disabled = true;
-      hideStatus(el('resetStatus'));
-      el('modalReset').showModal();
+      openResetModal();
+    });
+    el('btnResetUnlock').addEventListener('click', (e) => {
+      e.preventDefault();
+      openResetModal();
     });
     el('inputResetConfirm').addEventListener('input', (e) => {
       el('btnResetConfirm').disabled = e.target.value !== 'RESET';

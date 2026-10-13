@@ -53,8 +53,8 @@
           <p class="card__warning">Этот пароль показывается <strong>только один раз</strong>. Утерян — восстановление
             невозможно.</p>
           <div class="password-field">
-            <textarea id="masterPassword" class="input input--mono input--password" rows="2" readonly
-              spellcheck="false"></textarea>
+            <input id="masterPassword" class="input input--mono input--output" readonly
+              spellcheck="false" autocomplete="off" />
             <div class="password-field__actions">
               <button id="btnCopyMaster" class="btn btn--ghost btn--sm">Скопировать</button>
               <button id="btnHideMaster" class="btn btn--ghost btn--sm">Скрыть/Показать</button>
@@ -87,6 +87,10 @@
           <div id="lockoutBlock" class="lockout" hidden>
             <p class="lockout__text">Блокировка после неудачных попыток. Осталось: <span id="lockoutLeft">0</span> с</p>
             <button id="btnUnlockRetry" class="btn btn--ghost btn--sm">Обновить</button>
+          </div>
+          <div class="form__actions">
+            <a id="btnResetUnlock" class="btn btn--danger-ghost" href="#" title="Полностью сбросить устройство">Забыли
+              мастер-пароль? Сбросить устройство</a>
           </div>
         </div>
       </section>
