@@ -16,8 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::config::{
-    AUTH_LOCKOUT_MS, AUTH_MAX_FAIL, KEYFILE_MAX_BYTES, MASTER_PASSWORD_CHARS, MAX_PASS_CHARS,
-    SESSION_TOKEN_LEN, SESSION_TTL_MS,
+    AUTH_LOCKOUT_MS, AUTH_MAX_FAIL, KEYFILE_GENERATED_BYTES, KEYFILE_MAX_BYTES,
+    MASTER_PASSWORD_CHARS, MAX_PASS_CHARS, SESSION_TOKEN_LEN, SESSION_TTL_MS,
 };
 use crate::crypto;
 use crate::hex;
@@ -115,6 +115,8 @@ pub enum KeyfileAction {
     Set = 1,
     /// Remove the key file.
     Clear = 2,
+    /// Replace the key file with one generated on the device.
+    Generate = 3,
 }
 
 impl core::fmt::Display for KeyfileAction {
@@ -123,6 +125,7 @@ impl core::fmt::Display for KeyfileAction {
             KeyfileAction::Keep => "keep",
             KeyfileAction::Set => "set",
             KeyfileAction::Clear => "clear",
+            KeyfileAction::Generate => "generate",
         })
     }
 }
@@ -140,6 +143,7 @@ pub struct Request {
     key_file_new: Vec<u8>,
     keyfile_action: KeyfileAction,
     has_new_password: bool,
+    generate_keyfile: bool,
 }
 
 impl Request {
@@ -153,6 +157,7 @@ impl Request {
             key_file_new: Vec::new(),
             keyfile_action: KeyfileAction::Keep,
             has_new_password: false,
+            generate_keyfile: false,
         }
     }
 }
@@ -191,12 +196,15 @@ pub struct JobView {
     pub password: Vec<u8>,
     /// One-shot session token (hex ASCII), if any.
     pub session_token: Vec<u8>,
+    /// One-shot device-generated key file, if any.
+    pub key_file: Vec<u8>,
 }
 
 impl Drop for JobView {
     fn drop(&mut self) {
         crypto::wipe(&mut self.password);
         crypto::wipe(&mut self.session_token);
+        crypto::wipe(&mut self.key_file);
     }
 }
 
@@ -249,6 +257,8 @@ struct Slot {
     password: Vec<u8>,
     /// One-shot session token (hex ASCII).
     session_token: Vec<u8>,
+    /// One-shot device-generated key file, wiped on first poll / next submit.
+    key_file: Vec<u8>,
 }
 
 impl Slot {
@@ -259,11 +269,13 @@ impl Slot {
             result: JobResult::Pending,
             password: Vec::new(),
             session_token: Vec::new(),
+            key_file: Vec::new(),
         }
     }
     fn wipe_secrets(&mut self) {
         wipe_vec(&mut self.password);
         wipe_vec(&mut self.session_token);
+        wipe_vec(&mut self.key_file);
     }
 }
 
@@ -318,12 +330,19 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
 
     /// Orders provisioning. Refused up-front when the vault is already
     /// provisioned: provisioning wipes the whole partition.
-    pub fn submit_provision(&mut self, key_file: &[u8]) -> Submit {
-        if self.provisioned || key_file.len() > KEYFILE_MAX_BYTES {
+    ///
+    /// `generate_keyfile` asks the device to mint a key file. It conflicts with
+    /// a client-supplied `key_file`: one source only.
+    pub fn submit_provision(&mut self, key_file: &[u8], generate_keyfile: bool) -> Submit {
+        if self.provisioned
+            || key_file.len() > KEYFILE_MAX_BYTES
+            || (generate_keyfile && !key_file.is_empty())
+        {
             return (NO_JOB, None);
         }
         let mut req = Request::new(Job::Provision);
         req.key_file.extend_from_slice(key_file);
+        req.generate_keyfile = generate_keyfile;
         self.enqueue(req)
     }
 
@@ -375,7 +394,14 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         if matches!(action, KeyfileAction::Set) && new_key_file.is_empty() {
             return (NO_JOB, None);
         }
-        if matches!(action, KeyfileAction::Clear) && !cur_key_file.is_empty() {
+        if matches!(action, KeyfileAction::Generate | KeyfileAction::Clear)
+            && !new_key_file.is_empty()
+        {
+            return (NO_JOB, None);
+        }
+        // A Keep with no new password would only re-encrypt under the same
+        // material; refuse it so a caller cannot submit an empty change.
+        if matches!(action, KeyfileAction::Keep) && new_password.map_or(true, str::is_empty) {
             return (NO_JOB, None);
         }
 
@@ -446,11 +472,20 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
 
         let mut pw = generate_password(&mut self.rng);
         debug_assert_eq!(pw.len(), MASTER_PASSWORD_CHARS);
-        let kf = keyfile_opt(&req.key_file);
+        // A device-generated key file lives on the stack only until it is
+        // copied into the slot, and is wiped unconditionally afterwards.
+        let mut gen_kf = [0u8; KEYFILE_GENERATED_BYTES];
+        let kf = if req.generate_keyfile {
+            self.rng.fill(&mut gen_kf);
+            Some(gen_kf.as_slice())
+        } else {
+            keyfile_opt(&req.key_file)
+        };
         let pw_str = core::str::from_utf8(&pw).expect("password is ASCII");
         let rc = vault.begin(pw_str, kf, &mut self.rng);
         if rc != VaultError::None {
             crypto::wipe(&mut pw);
+            crypto::wipe(&mut gen_kf);
             self.publish_result(req.id, Job::Provision, JobResult::Error);
             return;
         }
@@ -462,13 +497,18 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         self.fail_count = 0;
         self.lockout_until_ms = 0;
 
-        // Password and token are placed in the slot *before* publish_result()
-        // clears busy, so the next submit cannot wipe an uncollected secret.
+        // Password, token and a generated key file are placed in the slot
+        // *before* publish_result() clears busy, so the next submit cannot wipe
+        // an uncollected secret.
         self.slot.password.extend_from_slice(&pw);
         self.slot
             .session_token
             .extend_from_slice(hex::encode(&self.token).as_bytes());
+        if req.generate_keyfile {
+            self.slot.key_file.extend_from_slice(&gen_kf);
+        }
         crypto::wipe(&mut pw);
+        crypto::wipe(&mut gen_kf);
 
         self.publish_result(req.id, Job::Provision, JobResult::Ok);
     }
@@ -568,20 +608,34 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         } else {
             old_str
         };
+        let mut gen_kf = [0u8; KEYFILE_GENERATED_BYTES];
         let target = match req.keyfile_action {
             KeyfileAction::Set => keyfile_opt(&req.key_file_new),
             KeyfileAction::Keep => keyfile_opt(&req.key_file),
             KeyfileAction::Clear => None,
+            KeyfileAction::Generate => {
+                self.rng.fill(&mut gen_kf);
+                Some(gen_kf.as_slice())
+            }
         };
         let rc = vault.rekey(new_str, target, &mut self.rng);
+        let generated = req.keyfile_action == KeyfileAction::Generate;
         match rc {
             VaultError::None => {
+                // The new key file is placed in the slot before publish_result()
+                // clears busy, so the next submit cannot wipe it uncollected.
+                if generated {
+                    self.slot.key_file.extend_from_slice(&gen_kf);
+                }
+                crypto::wipe(&mut gen_kf);
                 self.publish_result(req.id, Job::Rekey, JobResult::Ok);
             }
             VaultError::BootStrap => {
+                crypto::wipe(&mut gen_kf);
                 self.publish_result(req.id, Job::Rekey, JobResult::Refused);
             }
             _ => {
+                crypto::wipe(&mut gen_kf);
                 self.publish_result(req.id, Job::Rekey, JobResult::Error);
             }
         }
@@ -617,11 +671,19 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         } else {
             Vec::new()
         };
+        let key_file = if ok && !self.slot.key_file.is_empty() {
+            let k = self.slot.key_file.clone();
+            wipe_vec(&mut self.slot.key_file);
+            k
+        } else {
+            Vec::new()
+        };
         Some(JobView {
             kind: self.slot.kind,
             result: self.slot.result,
             password,
             session_token,
+            key_file,
         })
     }
 
@@ -725,6 +787,15 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         let bytes = generate_password(&mut self.rng);
         String::from_utf8(bytes.to_vec()).expect("password is ASCII by construction")
     }
+
+    /// Generates a key file: `KEYFILE_GENERATED_BYTES` raw random bytes. Public
+    /// because its size is a user-facing contract that selftest validates.
+    #[must_use]
+    pub fn generate_keyfile(&mut self) -> [u8; KEYFILE_GENERATED_BYTES] {
+        let mut kf = [0u8; KEYFILE_GENERATED_BYTES];
+        self.rng.fill(&mut kf);
+        kf
+    }
 }
 
 /// Wipes then truncates a secret buffer so "non-empty" means "still set".
@@ -761,7 +832,7 @@ mod tests {
         a: &mut Auth<CycleSource<'static>, ManualClock>,
         v: &mut Vault<MemStorage>,
     ) -> String {
-        let (id, req) = a.submit_provision(&[]);
+        let (id, req) = a.submit_provision(&[], false);
         assert_ne!(id, NO_JOB);
         a.run(v, req.as_ref().unwrap());
         let view = a.poll(id).unwrap();
@@ -841,18 +912,20 @@ mod tests {
         let mut v = vault();
         a.initialize(&v);
 
-        let (id, req) = a.submit_provision(&[]);
+        let (id, req) = a.submit_provision(&[], false);
         a.run(&mut v, req.as_ref().unwrap());
 
         let first = a.poll(id).unwrap();
         assert_eq!(first.result, JobResult::Ok);
         assert!(!first.password.is_empty());
         assert!(!first.session_token.is_empty());
+        assert!(first.key_file.is_empty());
 
         let second = a.poll(id).unwrap();
         assert_eq!(second.result, JobResult::Ok);
         assert!(second.password.is_empty());
         assert!(second.session_token.is_empty());
+        assert!(second.key_file.is_empty());
     }
 
     #[test]
@@ -864,7 +937,7 @@ mod tests {
         let _pw = provision(&mut a, &mut v);
         assert!(a.state().provisioned);
 
-        let (id, _req) = a.submit_provision(&[]);
+        let (id, _req) = a.submit_provision(&[], false);
         assert_eq!(id, NO_JOB);
     }
 
@@ -1002,12 +1075,196 @@ mod tests {
                 .0,
             NO_JOB
         );
-        // Clear is rejected while a current key file is present.
-        assert_eq!(
+    }
+
+    #[test]
+    fn rekey_clear_targets_new_keyfile_not_current() {
+        // The current key file authenticates the vault, so Clear must accept
+        // it; it is a stray *new* file that Clear rejects.
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        assert_ne!(
             a.submit_rekey(PW, None, b"cur", &[], KeyfileAction::Clear)
                 .0,
             NO_JOB
         );
+
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        assert_eq!(
+            a.submit_rekey(PW, None, b"cur", b"stray", KeyfileAction::Clear)
+                .0,
+            NO_JOB
+        );
+    }
+
+    #[test]
+    fn rekey_rejects_empty_change() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        assert_eq!(
+            a.submit_rekey(PW, None, &[], &[], KeyfileAction::Keep).0,
+            NO_JOB
+        );
+        assert_eq!(
+            a.submit_rekey(PW, Some(""), &[], &[], KeyfileAction::Keep)
+                .0,
+            NO_JOB
+        );
+    }
+
+    #[test]
+    fn rekey_keyfile_only_set_keeps_password() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let pw = provision(&mut a, &mut v);
+
+        let new_kf = b"client supplied keyfile material";
+        let (id, req) = a.submit_rekey(&pw, None, &[], new_kf, KeyfileAction::Set);
+        assert_ne!(id, NO_JOB);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+        assert!(v.key_file_required());
+        assert!(a.state().unlocked);
+
+        // The password is unchanged: it opens only together with the new file.
+        a.lock(&mut v);
+        let (id, req) = a.submit_unlock(&pw, &[]);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::WrongPassword);
+
+        let (id, req) = a.submit_unlock(&pw, new_kf);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+    }
+
+    #[test]
+    fn rekey_clear_removes_keyfile() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        // Start from a key-file-protected vault.
+        let (id, req) = a.submit_provision(&[], true);
+        assert_ne!(id, NO_JOB);
+        a.run(&mut v, req.as_ref().unwrap());
+        let view = a.poll(id).unwrap();
+        assert_eq!(view.result, JobResult::Ok);
+        let pw = String::from_utf8(view.password.clone()).unwrap();
+        let kf = view.key_file.clone();
+        assert!(v.key_file_required());
+
+        // The password is kept; only the key file is removed.
+        let (id, req) = a.submit_rekey(&pw, None, &kf, &[], KeyfileAction::Clear);
+        assert_ne!(id, NO_JOB);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+        assert!(!v.key_file_required());
+
+        a.lock(&mut v);
+        let (id, req) = a.submit_unlock(&pw, &[]);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+    }
+
+    #[test]
+    fn provision_generates_keyfile_and_requires_it() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+
+        let (id, req) = a.submit_provision(&[], true);
+        assert_ne!(id, NO_JOB);
+        a.run(&mut v, req.as_ref().unwrap());
+        let view = a.poll(id).unwrap();
+        assert_eq!(view.result, JobResult::Ok);
+        let pw = String::from_utf8(view.password.clone()).unwrap();
+        assert_eq!(view.key_file.len(), KEYFILE_GENERATED_BYTES);
+        assert!(v.key_file_required());
+        let kf = view.key_file.clone();
+
+        // Without the file the password alone is not enough; with it, it opens.
+        a.lock(&mut v);
+        let (id, req) = a.submit_unlock(&pw, &[]);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::WrongPassword);
+
+        let (id, req) = a.submit_unlock(&pw, &kf);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+    }
+
+    #[test]
+    fn provision_generate_conflicts_with_supplied_keyfile() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        assert_eq!(a.submit_provision(b"client file", true).0, NO_JOB);
+    }
+
+    #[test]
+    fn poll_delivers_generated_keyfile_once() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let (id, req) = a.submit_provision(&[], true);
+        a.run(&mut v, req.as_ref().unwrap());
+        let first = a.poll(id).unwrap();
+        assert_eq!(first.key_file.len(), KEYFILE_GENERATED_BYTES);
+        let second = a.poll(id).unwrap();
+        assert!(second.key_file.is_empty());
+    }
+
+    #[test]
+    fn rekey_generate_replaces_keyfile() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let pw = provision(&mut a, &mut v);
+
+        let (id, req) = a.submit_rekey(&pw, None, &[], &[], KeyfileAction::Generate);
+        assert_ne!(id, NO_JOB);
+        a.run(&mut v, req.as_ref().unwrap());
+        let view = a.poll(id).unwrap();
+        assert_eq!(view.result, JobResult::Ok);
+        assert_eq!(view.key_file.len(), KEYFILE_GENERATED_BYTES);
+        assert!(v.key_file_required());
+        let kf = view.key_file.clone();
+
+        a.lock(&mut v);
+        let (id, req) = a.submit_unlock(&pw, &[]);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::WrongPassword);
+
+        let (id, req) = a.submit_unlock(&pw, &kf);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+    }
+
+    #[test]
+    fn rekey_generate_rejects_supplied_new_keyfile() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        assert_eq!(
+            a.submit_rekey(PW, Some(PW2), &[], b"client file", KeyfileAction::Generate)
+                .0,
+            NO_JOB
+        );
+    }
+
+    #[test]
+    fn generate_keyfile_uses_rng_not_a_constant() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let kf1 = a.generate_keyfile();
+        let kf2 = a.generate_keyfile();
+        assert_eq!(kf1.len(), KEYFILE_GENERATED_BYTES);
+        assert!(kf1.iter().any(|&b| b != 0));
+        assert_ne!(kf1, kf2, "consecutive draws must differ");
     }
 
     #[test]

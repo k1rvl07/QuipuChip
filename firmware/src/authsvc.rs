@@ -49,6 +49,7 @@ enum Command {
     Tick,
     Provision {
         key_file: Vec<u8>,
+        generate_keyfile: bool,
     },
     Unlock {
         password: Vec<u8>,
@@ -132,6 +133,7 @@ struct JobSlot {
     result: JobResult,
     password: Vec<u8>,
     token: Vec<u8>,
+    key_file: Vec<u8>,
 }
 
 impl JobSlot {
@@ -142,6 +144,7 @@ impl JobSlot {
             result: JobResult::Pending,
             password: Vec::new(),
             token: Vec::new(),
+            key_file: Vec::new(),
         }
     }
 
@@ -150,6 +153,8 @@ impl JobSlot {
         self.password.clear();
         crypto::wipe(&mut self.token);
         self.token.clear();
+        crypto::wipe(&mut self.key_file);
+        self.key_file.clear();
     }
 
     fn begin(&mut self, id: JobId, kind: Job) {
@@ -159,11 +164,19 @@ impl JobSlot {
         self.result = JobResult::Pending;
     }
 
-    fn complete(&mut self, kind: Job, result: JobResult, password: Vec<u8>, token: Vec<u8>) {
+    fn complete(
+        &mut self,
+        kind: Job,
+        result: JobResult,
+        password: Vec<u8>,
+        token: Vec<u8>,
+        key_file: Vec<u8>,
+    ) {
         self.kind = kind;
         self.result = result;
         self.password = password;
         self.token = token;
+        self.key_file = key_file;
     }
 }
 
@@ -210,8 +223,11 @@ pub async fn worker(mut auth: WorkerAuth, mut vault: WorkerVault) {
 async fn handle(auth: &mut WorkerAuth, vault: &mut WorkerVault, cmd: Command) {
     match cmd {
         Command::Tick => {}
-        Command::Provision { mut key_file } => {
-            let (id, req) = auth.submit_provision(&key_file);
+        Command::Provision {
+            mut key_file,
+            generate_keyfile,
+        } => {
+            let (id, req) = auth.submit_provision(&key_file, generate_keyfile);
             begin(auth, vault, id, Job::Provision).await;
             crypto::wipe(&mut key_file);
             run_and_finish(auth, vault, id, req);
@@ -334,9 +350,10 @@ fn run_and_finish(
         if let Some(view) = auth.poll(id) {
             let password = view.password.clone();
             let token = view.session_token.clone();
+            let key_file = view.key_file.clone();
             SHARED.job.lock(|j| {
                 j.borrow_mut()
-                    .complete(view.kind, view.result, password, token);
+                    .complete(view.kind, view.result, password, token, key_file);
             });
         }
     }
@@ -362,8 +379,12 @@ async fn submit(cmd: Command) -> JobId {
     }
 }
 
-pub async fn submit_provision(key_file: Vec<u8>) -> JobId {
-    submit(Command::Provision { key_file }).await
+pub async fn submit_provision(key_file: Vec<u8>, generate_keyfile: bool) -> JobId {
+    submit(Command::Provision {
+        key_file,
+        generate_keyfile,
+    })
+    .await
 }
 
 pub async fn submit_unlock(password: Vec<u8>, key_file: Vec<u8>) -> JobId {
@@ -520,12 +541,14 @@ pub(crate) struct PolledJob {
     pub(crate) result: JobResult,
     pub(crate) password: Vec<u8>,
     pub(crate) session_token: Vec<u8>,
+    pub(crate) key_file: Vec<u8>,
 }
 
 impl Drop for PolledJob {
     fn drop(&mut self) {
         crypto::wipe(&mut self.password);
         crypto::wipe(&mut self.session_token);
+        crypto::wipe(&mut self.key_file);
     }
 }
 
@@ -543,11 +566,13 @@ pub fn poll(id: JobId) -> Option<PolledJob> {
         let result = slot.result;
         let password = core::mem::take(&mut slot.password);
         let session_token = core::mem::take(&mut slot.token);
+        let key_file = core::mem::take(&mut slot.key_file);
         Some(PolledJob {
             kind,
             result,
             password,
             session_token,
+            key_file,
         })
     })
 }

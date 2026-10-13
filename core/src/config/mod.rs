@@ -32,3 +32,5 @@ const _: () = assert!(VAULT_REGION_BYTES % FLASH_SECTOR_BYTES == 0);
 const _: () = assert!(VAULT_COMPACT_TRIGGER_BYTES < VAULT_REGION_BYTES);
 const _: () = assert!(VAULT_LIVE_BUDGET_BYTES + MAX_ENTRY_LEN + 64 <= VAULT_REGION_BYTES);
 const _: () = assert!(KEYFILE_MAX_BYTES <= 4096);
+const _: () = assert!(KEYFILE_GENERATED_BYTES > 0);
+const _: () = assert!(KEYFILE_GENERATED_BYTES <= KEYFILE_MAX_BYTES);

@@ -21,7 +21,7 @@ fn provision_unlock_add_export_round_trip() {
     let mut v = vault();
     a.initialize(&v);
 
-    let (id, req) = a.submit_provision(&[]);
+    let (id, req) = a.submit_provision(&[], false);
     assert_ne!(id, NO_JOB);
     a.run(&mut v, req.as_ref().unwrap());
     let view = a.poll(id).unwrap();

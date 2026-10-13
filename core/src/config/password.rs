@@ -29,3 +29,7 @@ pub const PASSWORD_ALPHABET: &[u8] =
 
 /// Key file is never stored on device; the client sends it (base64).
 pub const KEYFILE_MAX_BYTES: usize = 4096;
+
+/// Bytes of a device-generated key file. 32 random bytes match the KeePass
+/// convention, so a generated file works as a KDBX key file too.
+pub const KEYFILE_GENERATED_BYTES: usize = 32;

@@ -39,8 +39,10 @@
           <div class="form form--column">
             <label class="label" for="inputSetupKeyfile">Ключевой файл (необязательно)</label>
             <input id="inputSetupKeyfile" type="file" class="input input--file" />
-            <p class="card__hint">Если выбрать файл, он будет требоваться при каждом входе. Максимум 4096 байт.
-              Без файла вход будет только по мастер-паролю.</p>
+            <label class="checkbox"><input type="checkbox" id="inputSetupGenKeyfile" />
+              Сгенерировать файл на устройстве</label>
+            <p class="card__hint">Если выбрать или сгенерировать файл, он будет требоваться при каждом входе.
+              Максимум 4096 байт. Без файла вход будет только по мастер-паролю.</p>
             <div class="form__actions">
               <button id="btnProvision" class="btn btn--primary btn--lg">Создать хранилище</button>
             </div>
@@ -62,6 +64,17 @@
             </div>
           </div>
           <p class="card__hint">Длина: <span id="masterLen">0</span> символов</p>
+        </div>
+
+        <div id="keyfileBlock" class="card" hidden>
+          <h3 class="card__subtitle">Ключевой файл (сохраните)</h3>
+          <p class="card__text">Файл-ключ сгенерирован на устройстве и уже скачан. Этот файл нужен при каждом входе —
+            храните его отдельно от мастер-пароля.</p>
+          <p class="card__warning">Если файл потерян, доступ к хранилищу восстановить невозможно.</p>
+          <div class="form__actions">
+            <button id="btnKeyfileDownload" class="btn btn--ghost btn--sm">Скачать ещё раз</button>
+            <button id="btnKeyfileSaved" class="btn btn--primary btn--sm">Я сохранил файл-ключ</button>
+          </div>
         </div>
       </section>
 
@@ -226,19 +239,19 @@
       <dialog id="modalRekey" class="modal">
         <form method="dialog" id="formRekey" class="modal__content">
           <header class="modal__header">
-            <h3 class="modal__title">Смена мастер-пароля</h3>
+            <h3 class="modal__title">Смена мастер-пароля и ключевого файла</h3>
             <button type="button" id="btnRekeyClose" class="btn btn--icon" title="Закрыть">✕</button>
           </header>
           <div class="modal__body">
-            <p class="card__text">Хранилище будет перешифровано под новый мастер-пароль. Записи и текущая сессия
-              сохранятся. Старый пароль после смены не действует.</p>
+            <p class="card__text">Хранилище будет перешифровано под новый мастер-пароль и/или ключевой файл. Записи
+              и текущая сессия сохранятся. Можно изменить только одно из двух.</p>
             <div class="form-field">
               <label class="label" for="inputRekeyOldPassword">Текущий мастер-пароль</label>
               <input id="inputRekeyOldPassword" type="password" class="input input--mono"
                 autocomplete="current-password" spellcheck="false" placeholder="Введите текущий пароль" />
             </div>
             <div class="form-field">
-              <label class="label" for="inputRekeyPassword">Новый мастер-пароль</label>
+              <label class="label" for="inputRekeyPassword">Новый мастер-пароль (оставьте пустым, чтобы не менять)</label>
               <div class="password-field">
                 <input id="inputRekeyPassword" type="password" class="input input--mono" autocomplete="new-password"
                   spellcheck="false" placeholder="Введите или сгенерируйте" />
@@ -254,15 +267,21 @@
               <input id="inputRekeyCurrentKeyfile" type="file" class="input input--file" />
             </div>
             <div class="form-field">
-              <label class="label" for="inputRekeyKeyfile">Новый ключевой файл (необязательно)</label>
-              <input id="inputRekeyKeyfile" type="file" class="input input--file" />
+              <label class="label" for="rekeyKeyfileAction">Ключевой файл</label>
+              <select id="rekeyKeyfileAction" class="input">
+                <option value="keep">Не менять</option>
+                <option value="set">Заменить на выбранный файл</option>
+                <option value="generate">Сгенерировать новый на устройстве</option>
+                <option value="clear">Удалить файл-ключ</option>
+              </select>
+              <input id="inputRekeyKeyfile" type="file" class="input input--file" hidden />
               <p class="card__hint" id="rekeyKeyfileHint"></p>
             </div>
             <div id="rekeyStatus" class="status" hidden></div>
           </div>
           <footer class="modal__footer">
             <button type="button" id="btnRekeyCancel" class="btn btn--ghost">Отмена</button>
-            <button type="submit" id="btnRekeySubmit" class="btn btn--primary">Сменить пароль</button>
+            <button type="submit" id="btnRekeySubmit" class="btn btn--primary">Применить</button>
           </footer>
         </form>
       </dialog>

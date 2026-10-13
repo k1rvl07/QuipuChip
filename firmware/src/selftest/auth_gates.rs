@@ -152,7 +152,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
 
     // Real provisioning: the password is delivered exactly once.
     let good = {
-        let (job, req) = auth.submit_provision(&[]);
+        let (job, req) = auth.submit_provision(&[], false);
         let mut ok = job != NO_JOB;
         if let Some(req) = req.as_ref() {
             auth.run(vault, req);
@@ -174,7 +174,7 @@ pub(super) fn auth_gates(vault: &mut WorkerVault, auth: &mut WorkerAuth, gate_pw
         );
         report("gateB-provision-once", ok && second_ok, &detail);
 
-        let again = auth.submit_provision(&[]);
+        let again = auth.submit_provision(&[], false);
         let refused = again.0 == NO_JOB && vault.provisioned();
         report(
             "gateB2-no-reprovision",

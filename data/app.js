@@ -22,6 +22,8 @@
     editingId: null,
     viewId: null,
     masterShown: '',
+    generatedKeyfileB64: '',
+    keyfileSaved: false,
     inAuthFlow: 0,
     lockoutTimer: null,
     totpTimer: null,
@@ -39,6 +41,9 @@
     keyfile_invalid_base64: 'Некорректный файл ключа',
     keyfile_too_large: 'Файл ключа больше 4096 байт',
     keyfile_not_a_string: 'Ошибка чтения файла ключа',
+    keyfile_conflict: 'Выберите файл или генерацию, но не оба',
+    generate_keyfile_not_a_bool: 'Некорректный запрос генерации файла',
+    nothing_to_change: 'Ничего не выбрано: задайте новый пароль или действие с ключевым файлом',
     confirmation_required: 'Введите RESET для подтверждения',
     too_many_entries: 'Хранилище переполнено — удалите запись',
     storage_full: 'Нет места во флеше хранилища',
@@ -430,6 +435,28 @@
     return { absent: false, b64: await fileToB64(file) };
   }
 
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) {
+      out[i] = bin.charCodeAt(i);
+    }
+    return out;
+  }
+
+  const KEYFILE_NAME = 'passmanager-keyfile.bin';
+
+  function downloadKeyfile(b64) {
+    const url = URL.createObjectURL(new Blob([b64ToBytes(b64)], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = KEYFILE_NAME;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+
   function randInt(max) {
     const zone = Math.floor(0x10000 / max) * max;
     const a = new Uint16Array(1);
@@ -483,16 +510,24 @@
     const btn = el('btnProvision');
     const st = el('setupStatus');
     hideStatus(st);
+    const generate = el('inputSetupGenKeyfile').checked;
     btn.disabled = true;
     try {
-      const kf = await readKeyfile(el('inputSetupKeyfile'), state.keyFileMaxBytes);
       const body = {};
-      if (!kf.absent) {
-        body.keyfile = kf.b64;
+      let wantKeyfile = false;
+      if (generate) {
+        body.generate_keyfile = true;
+        wantKeyfile = true;
+      } else {
+        const kf = await readKeyfile(el('inputSetupKeyfile'), state.keyFileMaxBytes);
+        if (!kf.absent) {
+          body.keyfile = kf.b64;
+          wantKeyfile = true;
+        }
       }
       const res = await submitJob('/api/auth/provision', body);
       state.masterShown = res.password || '';
-      state.keyfileRequired = !kf.absent;
+      state.keyfileRequired = wantKeyfile;
       // Provision succeeded and submitJob already saved the session token, so
       // the client state is unlocked here: the header controls and the footer
       // must show an open vault without a page reload.
@@ -501,7 +536,22 @@
       el('masterPassword').value = state.masterShown;
       el('masterLen').textContent = String(state.masterShown.length);
       el('masterBlock').hidden = false;
-      statusOf(st, 'ok', 'Хранилище создано. Сохраните мастер-пароль.');
+      if (res.keyfile) {
+        // The device minted the key file: hand it to the user immediately and
+        // gate finishing setup on an explicit "I saved it".
+        state.generatedKeyfileB64 = res.keyfile;
+        state.keyfileSaved = false;
+        downloadKeyfile(res.keyfile);
+        el('keyfileBlock').hidden = false;
+        el('btnDoneMaster').disabled = true;
+      }
+      statusOf(
+        st,
+        'ok',
+        res.keyfile
+          ? 'Хранилище создано. Сохраните мастер-пароль и файл-ключ.'
+          : 'Хранилище создано. Сохраните мастер-пароль.'
+      );
       updateFooter();
     } catch (e) {
       statusOf(st, 'error', errMsg(e.code));
@@ -845,16 +895,25 @@
   }
 
   function rekeyKeyfileHint() {
-    const hasNew = el('inputRekeyKeyfile').files && el('inputRekeyKeyfile').files.length > 0;
+    const action = el('rekeyKeyfileAction').value;
+    el('inputRekeyKeyfile').hidden = action !== 'set';
     let text;
-    if (state.keyfileRequired && hasNew) {
-      text = 'Файл будет заменён на выбранный; для входа потребуется новый файл.';
-    } else if (state.keyfileRequired && !hasNew) {
-      text = 'Текущий ключевой файл останется прежним.';
-    } else if (!state.keyfileRequired && hasNew) {
-      text = 'После смены вход будет требовать этот файл.';
-    } else {
-      text = 'Вход по паролю без файла — как сейчас.';
+    switch (action) {
+      case 'generate':
+        text = 'Будет создан новый файл-ключ на устройстве; для входа потребуется он.';
+        break;
+      case 'set':
+        text = 'Файл будет заменён на выбранный; для входа потребуется новый файл.';
+        break;
+      case 'clear':
+        text = state.keyfileRequired
+          ? 'Файл-ключ будет удалён; для входа останется только пароль.'
+          : 'Ключевой файл сейчас не используется — удалять нечего.';
+        break;
+      default:
+        text = state.keyfileRequired
+          ? 'Текущий ключевой файл останется прежним.'
+          : 'Вход по паролю без файла — как сейчас.';
     }
     el('rekeyKeyfileHint').textContent = text;
   }
@@ -871,18 +930,26 @@
       return;
     }
     const pw = el('inputRekeyPassword').value;
-    if (!pw) {
-      statusOf(st, 'error', 'Введите новый мастер-пароль');
+    if (pw && pw.length < 12) {
+      statusOf(st, 'error', 'Мастер-пароль должен быть не короче 12 символов');
       return;
     }
-    if (pw.length < 12) {
-      statusOf(st, 'error', 'Мастер-пароль должен быть не короче 12 символов');
+    const action = el('rekeyKeyfileAction').value;
+    if (!pw && action === 'keep') {
+      statusOf(st, 'error', 'Задайте новый пароль или действие с ключевым файлом');
+      return;
+    }
+    if (action === 'clear' && !state.keyfileRequired) {
+      statusOf(st, 'error', 'Ключевой файл сейчас не используется');
       return;
     }
     const btn = el('btnRekeySubmit');
     btn.disabled = true;
     try {
-      const body = { old_password: oldPw, password: pw };
+      const body = { old_password: oldPw, keyfile_action: action };
+      if (pw) {
+        body.password = pw;
+      }
       if (state.keyfileRequired) {
         const cur = await readKeyfile(el('inputRekeyCurrentKeyfile'), state.keyFileMaxBytes);
         if (cur.absent) {
@@ -891,16 +958,35 @@
         }
         body.keyfile_current = cur.b64;
       }
-      const kf = await readKeyfile(el('inputRekeyKeyfile'), state.keyFileMaxBytes);
-      if (!kf.absent) {
-        body.keyfile_action = 'set';
+      if (action === 'set') {
+        const kf = await readKeyfile(el('inputRekeyKeyfile'), state.keyFileMaxBytes);
+        if (kf.absent) {
+          statusOf(st, 'error', 'Выберите новый ключевой файл');
+          return;
+        }
         body.keyfile_new = kf.b64;
       }
-      await submitJob('/api/auth/rekey', body);
+      const res = await submitJob('/api/auth/rekey', body);
+      let note = '';
+      if (res && res.keyfile) {
+        state.generatedKeyfileB64 = res.keyfile;
+        state.keyfileRequired = true;
+        downloadKeyfile(res.keyfile);
+        note = ' Новый файл-ключ создан и скачан — сохраните его.';
+      }
       await fetchState();
-      statusOf(st, 'ok', 'Мастер-пароль изменён. Хранилище перешифровано.');
+      const parts = [];
+      if (pw) {
+        parts.push('мастер-пароль');
+      }
+      if (action !== 'keep') {
+        parts.push('файл-ключ');
+      }
+      statusOf(st, 'ok', `Обновлено: ${parts.join(' и ')}. Хранилище перешифровано.${note}`);
       el('inputRekeyOldPassword').value = '';
       el('inputRekeyPassword').value = '';
+      el('inputRekeyKeyfile').value = '';
+      el('rekeyKeyfileAction').value = 'keep';
       updateFooter();
       setTimeout(() => {
         el('modalRekey').close();
@@ -1359,6 +1445,13 @@
     el('btnCopyMaster').addEventListener('click', () => copyText(state.masterShown, el('btnCopyMaster')));
     el('btnHideMaster').addEventListener('click', toggleMaster);
     el('btnDoneMaster').addEventListener('click', async () => {
+      if (state.generatedKeyfileB64 && !state.keyfileSaved) {
+        statusOf(el('setupStatus'), 'error', 'Сохраните файл-ключ и подтвердите это');
+        return;
+      }
+      el('keyfileBlock').hidden = true;
+      state.generatedKeyfileB64 = '';
+      state.keyfileSaved = false;
       el('masterBlock').hidden = true;
       state.masterShown = '';
       el('masterPassword').value = '';
@@ -1366,6 +1459,23 @@
       // header controls) open immediately instead of after a reload.
       await fetchState().catch(() => {});
       await enterApp();
+    });
+    el('btnKeyfileDownload').addEventListener('click', () => {
+      if (state.generatedKeyfileB64) {
+        downloadKeyfile(state.generatedKeyfileB64);
+      }
+    });
+    el('btnKeyfileSaved').addEventListener('click', () => {
+      state.keyfileSaved = true;
+      el('btnDoneMaster').disabled = false;
+      statusOf(el('setupStatus'), 'ok', 'Файл-ключ отмечен как сохранённый.');
+    });
+    el('inputSetupGenKeyfile').addEventListener('change', () => {
+      const generate = el('inputSetupGenKeyfile').checked;
+      el('inputSetupKeyfile').disabled = generate;
+      if (generate) {
+        el('inputSetupKeyfile').value = '';
+      }
     });
 
     el('formUnlock').addEventListener('submit', doUnlock);
@@ -1447,12 +1557,19 @@
       el('btnRekeyToggle').textContent = 'Показать';
       el('inputRekeyCurrentKeyfile').value = '';
       el('inputRekeyKeyfile').value = '';
+      el('rekeyKeyfileAction').value = 'keep';
       el('rekeyCurrentKeyfileBlock').hidden = !state.keyfileRequired;
       hideStatus(el('rekeyStatus'));
       rekeyKeyfileHint();
       el('modalRekey').showModal();
     });
     el('inputRekeyKeyfile').addEventListener('change', rekeyKeyfileHint);
+    el('rekeyKeyfileAction').addEventListener('change', () => {
+      if (el('rekeyKeyfileAction').value !== 'set') {
+        el('inputRekeyKeyfile').value = '';
+      }
+      rekeyKeyfileHint();
+    });
     el('btnRekeyClose').addEventListener('click', () => el('modalRekey').close());
     el('btnRekeyCancel').addEventListener('click', () => el('modalRekey').close());
     el('formRekey').addEventListener('submit', doRekey);

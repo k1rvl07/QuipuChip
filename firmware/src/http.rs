@@ -913,14 +913,25 @@ async fn provision<R: Read>(
         return Err(conflict("inconsistent_state"));
     }
 
-    let key_file = if body.content_length() > 0 {
+    let (key_file, generate_keyfile) = if body.content_length() > 0 {
         let doc = read_json_body(parts, body).await?;
-        keyfile_field(&doc, "keyfile")?
+        let key_file = keyfile_field(&doc, "keyfile")?;
+        let generate = match doc.get("generate_keyfile") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(bad_request("generate_keyfile_not_a_bool")),
+        };
+        // One source only: a client-supplied file and a device-generated one
+        // cannot both define the key.
+        if generate && !key_file.is_empty() {
+            return Err(bad_request("keyfile_conflict"));
+        }
+        (key_file, generate)
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
 
-    let id = authsvc::submit_provision(key_file).await;
+    let id = authsvc::submit_provision(key_file, generate_keyfile).await;
     if id == NO_JOB {
         return Err(busy());
     }
@@ -991,6 +1002,9 @@ fn job_poll(path: &str) -> Result<Outcome, HttpError> {
     match core::str::from_utf8(&view.session_token) {
         Ok(tok) if !tok.is_empty() => body["session_token"] = Value::String(tok.to_string()),
         _ => {}
+    }
+    if !view.key_file.is_empty() {
+        body["keyfile"] = Value::String(pm_core::base64::encode(&view.key_file));
     }
     Ok(json_outcome(200, body))
 }
@@ -1107,6 +1121,7 @@ async fn rekey<R: Read>(
         Some(Value::String(a)) if a == "keep" => KeyfileAction::Keep,
         Some(Value::String(a)) if a == "set" => KeyfileAction::Set,
         Some(Value::String(a)) if a == "clear" => KeyfileAction::Clear,
+        Some(Value::String(a)) if a == "generate" => KeyfileAction::Generate,
         Some(_) => return Err(bad_request("keyfile_action_invalid")),
     };
 
@@ -1119,6 +1134,10 @@ async fn rekey<R: Read>(
     } else {
         Vec::new()
     };
+
+    if new_password.is_none() && action == KeyfileAction::Keep {
+        return Err(bad_request("nothing_to_change"));
+    }
 
     let id = authsvc::submit_rekey(
         old.as_bytes().to_vec(),
