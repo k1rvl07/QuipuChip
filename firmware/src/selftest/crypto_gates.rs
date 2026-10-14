@@ -136,16 +136,18 @@ pub(super) fn crypto_gates() {
             (2000000000, "279037"),
         ];
         let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let digits = config::TOTP_DIGITS;
+        let period = config::TOTP_PERIOD_SEC;
         let mut ok_count = 0u32;
         for (t, expect) in VECTORS {
-            if totp::compute(secret, *t as u64).is_ok_and(|code| code == *expect) {
+            if totp::compute(secret, *t as u64, digits, period).is_ok_and(|code| code == *expect) {
                 ok_count += 1;
             }
         }
         let rejects = !totp::is_valid_secret("abc")
             && !totp::is_valid_secret("ABCDEFGH1IJKLMNOP")
             && !totp::is_valid_secret("")
-            && totp::compute("too-short", 59).is_err();
+            && totp::compute("too-short", 59, digits, period).is_err();
         report(
             "crypto-totp-rfc6238",
             ok_count == 5 && rejects,

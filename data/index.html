@@ -172,7 +172,7 @@
                     <button type="button" id="btnCopyPass" class="btn btn--ghost btn--sm">Скопировать</button>
                   </div>
                 </div>
-                <p class="card__hint" id="entryPasswordHint" hidden>Пусто — пароль записи не меняется.</p>
+                <p class="card__hint" id="entryPasswordHint" hidden>Показан текущий пароль. Очистите поле, чтобы удалить пароль.</p>
                 <div class="generator" id="genOpts" hidden>
                   <div class="generator__row">
                     <label class="label label--inline">Длина: <span id="genLenVal">16</span></label>
@@ -183,6 +183,9 @@
                     <label class="checkbox"><input type="checkbox" id="genLower" checked /> Строчные</label>
                     <label class="checkbox"><input type="checkbox" id="genDigits" checked /> Цифры</label>
                     <label class="checkbox"><input type="checkbox" id="genSym" /> Символы</label>
+                  </div>
+                  <div class="generator__row">
+                    <button type="button" id="btnGenAgain" class="btn btn--ghost btn--sm">Сгенерировать ещё</button>
                   </div>
                 </div>
               </div>
@@ -201,6 +204,16 @@
                 <input id="entryTotp" type="text" class="input input--mono" spellcheck="false" maxlength="63"
                   placeholder="Base32 без пробелов, напр. GEZDGNBV…" autocomplete="off" />
                 <p class="card__hint">Необязательно. Коды будут считаться на устройстве по коду из секрета.</p>
+              </div>
+              <div class="form-field">
+                <label class="label" for="entryTotpDigits">Цифр в TOTP-коде</label>
+                <input id="entryTotpDigits" type="number" class="input" min="6" max="8" step="1"
+                  inputmode="numeric" value="6" />
+              </div>
+              <div class="form-field">
+                <label class="label" for="entryTotpPeriod">Период TOTP, секунд</label>
+                <input id="entryTotpPeriod" type="number" class="input" min="10" max="120" step="1"
+                  inputmode="numeric" value="30" />
               </div>
               <div class="form-field form-field--full">
                 <label class="label" for="entryNote">Заметки</label>
@@ -226,9 +239,8 @@
             <button type="button" id="btnViewClose" class="btn btn--icon" title="Закрыть">✕</button>
           </header>
           <div class="modal__body" id="viewBody"></div>
-          <footer class="modal__footer">
+          <footer class="modal__footer modal__footer--center">
             <button type="button" id="btnViewTotp" class="btn btn--ghost" hidden>Показать код TOTP</button>
-            <div class="modal__spacer"></div>
             <button type="button" id="btnViewEdit" class="btn btn--ghost">Редактировать</button>
             <button type="button" id="btnViewClose2" class="btn btn--primary">Закрыть</button>
           </footer>

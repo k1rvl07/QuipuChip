@@ -258,6 +258,12 @@ html, body {
   border-color: transparent;
 }
 
+.btn--icon svg {
+  width: 1rem;
+  height: 1rem;
+  display: block;
+}
+
 .btn--file {
   cursor: pointer;
 }
@@ -459,7 +465,7 @@ html, body {
 
 .list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: 1fr;
   gap: 1rem;
 }
 
@@ -604,6 +610,10 @@ html, body {
   flex: 1;
 }
 
+.modal__footer--center {
+  justify-content: center;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -688,6 +698,68 @@ html, body {
   gap: 0.6rem;
   flex-wrap: wrap;
   margin-top: 0.25rem;
+}
+
+/* Credential row (login/password) shared by entry cards and the view modal:
+   label and action buttons on one line, the value below. */
+.cred {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.cred__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.cred__label {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.cred__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.cred__value {
+  margin: 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  color: var(--text);
+}
+
+.card-totp__code {
+  font-size: 1.5rem;
+  letter-spacing: 0.2em;
+}
+
+.card-totp__bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+
+.card-totp__bar-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--primary-bg);
+}
+
+.card-totp__meta {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.85rem;
 }
 
 .totp-box {

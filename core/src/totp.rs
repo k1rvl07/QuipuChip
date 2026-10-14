@@ -1,12 +1,17 @@
 //! TOTP (RFC 6238), ported from the removed C++ reference.
 //!
-//! Algorithm is fixed: SHA-1, 6 digits, 30-second period. The secret is stored
-//! as an RFC 4648 base32 string (case-insensitive, optional `=` padding). Only
-//! the standard profile is supported; `otpauth://` URIs are not parsed.
+//! Algorithm is fixed: SHA-1. The digit count and period are per entry; a record
+//! that carries no explicit value falls back to the reference profile (6 digits,
+//! 30-second period). The secret is stored as an RFC 4648 base32 string
+//! (case-insensitive, optional `=` padding). Only the standard profile is
+//! supported; `otpauth://` URIs are not parsed.
 
 use alloc::{format, string::String};
 
-use crate::config::{TOTP_DIGITS, TOTP_PERIOD_SEC, TOTP_SECRET_MAX};
+use crate::config::{
+    TOTP_DIGITS, TOTP_DIGITS_MAX, TOTP_DIGITS_MIN, TOTP_PERIOD_MAX_SEC, TOTP_PERIOD_MIN_SEC,
+    TOTP_PERIOD_SEC, TOTP_SECRET_MAX,
+};
 use crate::crypto::hmac_sha1;
 
 /// Errors from computing a TOTP code.
@@ -14,11 +19,16 @@ use crate::crypto::hmac_sha1;
 pub enum TotpError {
     /// Secret is empty, too short, too long, or not valid base32.
     BadSecret,
+    /// Digit count or period is out of range.
+    BadParams,
 }
 
 impl core::fmt::Display for TotpError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("invalid TOTP secret")
+        f.write_str(match self {
+            TotpError::BadSecret => "invalid TOTP secret",
+            TotpError::BadParams => "invalid TOTP parameters",
+        })
     }
 }
 
@@ -80,15 +90,24 @@ pub fn is_valid_secret(secret: &str) -> bool {
     matches!(decode_base32(bytes, &mut key), Some(n) if n >= 10)
 }
 
-/// Computes the 6-digit code for `time_sec`. Returns it zero-padded.
-pub fn compute(secret: &str, time_sec: u64) -> Result<String, TotpError> {
+/// Computes the TOTP code for `time_sec`.
+///
+/// `digits` must be in `TOTP_DIGITS_MIN..=TOTP_DIGITS_MAX` and `period` must be
+/// in `TOTP_PERIOD_MIN_SEC..=TOTP_PERIOD_MAX_SEC`. The code is zero-padded to
+/// `digits`.
+pub fn compute(secret: &str, time_sec: u64, digits: u32, period: u64) -> Result<String, TotpError> {
+    if !(TOTP_DIGITS_MIN..=TOTP_DIGITS_MAX).contains(&digits)
+        || !(TOTP_PERIOD_MIN_SEC..=TOTP_PERIOD_MAX_SEC).contains(&period)
+    {
+        return Err(TotpError::BadParams);
+    }
     let mut key = [0u8; 64];
     let key_len = decode_base32(secret.as_bytes(), &mut key).ok_or(TotpError::BadSecret)?;
     if key_len < 10 {
         crate::crypto::wipe(&mut key);
         return Err(TotpError::BadSecret);
     }
-    let counter = time_sec / TOTP_PERIOD_SEC;
+    let counter = time_sec / period;
     let msg = counter.to_be_bytes();
     let mac = hmac_sha1(&key[..key_len], &msg);
     crate::crypto::wipe(&mut key);
@@ -99,12 +118,52 @@ pub fn compute(secret: &str, time_sec: u64) -> Result<String, TotpError> {
         | (u32::from(mac[off + 1]) << 16)
         | (u32::from(mac[off + 2]) << 8)
         | u32::from(mac[off + 3]);
-    let modulus = 10u32.pow(TOTP_DIGITS);
+    let modulus = 10u32.pow(digits);
     Ok(format!(
         "{:0width$}",
         bin % modulus,
-        width = TOTP_DIGITS as usize
+        width = digits as usize
     ))
+}
+
+/// Resolves a stored digit count. Empty means the default profile; a non-empty
+/// value must be decimal ASCII within `TOTP_DIGITS_MIN..=TOTP_DIGITS_MAX`.
+#[must_use]
+pub fn resolve_digits(raw: &[u8]) -> Option<u32> {
+    let v = parse_bounded(
+        raw,
+        u64::from(TOTP_DIGITS),
+        u64::from(TOTP_DIGITS_MIN),
+        u64::from(TOTP_DIGITS_MAX),
+    )?;
+    u32::try_from(v).ok()
+}
+
+/// Resolves a stored period (seconds). Empty means the default profile; a
+/// non-empty value must be decimal ASCII within the accepted range.
+#[must_use]
+pub fn resolve_period(raw: &[u8]) -> Option<u64> {
+    parse_bounded(
+        raw,
+        TOTP_PERIOD_SEC,
+        TOTP_PERIOD_MIN_SEC,
+        TOTP_PERIOD_MAX_SEC,
+    )
+}
+
+/// Shared parser: empty -> `default`, otherwise decimal ASCII within
+/// `min..=max`. Anything else (non-digit, empty-but-present, out of range,
+/// overflow) is rejected.
+fn parse_bounded(raw: &[u8], default: u64, min: u64, max: u64) -> Option<u64> {
+    if raw.is_empty() {
+        return Some(default);
+    }
+    let s = core::str::from_utf8(raw).ok()?;
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v: u64 = s.parse().ok()?;
+    (min..=max).contains(&v).then_some(v)
 }
 
 #[cfg(test)]
@@ -123,8 +182,59 @@ mod tests {
             (2_000_000_000, "279037"),
         ];
         for (t, want) in vectors {
-            assert_eq!(compute(secret, *t).unwrap(), *want, "t={t}");
+            assert_eq!(
+                compute(secret, *t, TOTP_DIGITS, TOTP_PERIOD_SEC).unwrap(),
+                *want,
+                "t={t}"
+            );
         }
+    }
+
+    #[test]
+    fn rfc6238_sha1_vectors_8_digits() {
+        // Same secret, 8-digit profile (RFC 6238 appendix B).
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let vectors: &[(u64, &str)] = &[
+            (59, "94287082"),
+            (1_111_111_109, "07081804"),
+            (1_111_111_111, "14050471"),
+            (1_234_567_890, "89005924"),
+            (2_000_000_000, "69279037"),
+        ];
+        for (t, want) in vectors {
+            assert_eq!(
+                compute(secret, *t, 8, TOTP_PERIOD_SEC).unwrap(),
+                *want,
+                "t={t}"
+            );
+        }
+    }
+
+    #[test]
+    fn digits_and_period_resolution() {
+        // Empty -> default profile.
+        assert_eq!(resolve_digits(b""), Some(TOTP_DIGITS));
+        assert_eq!(resolve_period(b""), Some(TOTP_PERIOD_SEC));
+        // Explicit valid values.
+        assert_eq!(resolve_digits(b"8"), Some(8));
+        assert_eq!(resolve_period(b"60"), Some(60));
+        assert_eq!(resolve_period(b"120"), Some(120));
+        // Out of range / not a number.
+        assert_eq!(resolve_digits(b"5"), None);
+        assert_eq!(resolve_digits(b"9"), None);
+        assert_eq!(resolve_period(b"9"), None);
+        assert_eq!(resolve_period(b"121"), None);
+        assert_eq!(resolve_digits(b"6x"), None);
+        assert_eq!(resolve_period(b"-1"), None);
+    }
+
+    #[test]
+    fn compute_rejects_bad_parameters() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        assert_eq!(compute(secret, 59, 5, 30), Err(TotpError::BadParams));
+        assert_eq!(compute(secret, 59, 9, 30), Err(TotpError::BadParams));
+        assert_eq!(compute(secret, 59, 6, 0), Err(TotpError::BadParams));
+        assert_eq!(compute(secret, 59, 6, 9), Err(TotpError::BadParams));
     }
 
     #[test]
@@ -133,7 +243,7 @@ mod tests {
         // '1' is not in the base32 alphabet.
         assert!(!is_valid_secret("ABCDEFGH1IJKLMNOP"));
         assert!(!is_valid_secret(""));
-        assert!(compute("too-short", 59).is_err());
+        assert!(compute("too-short", 59, TOTP_DIGITS, TOTP_PERIOD_SEC).is_err());
         // Sanity: the RFC secret above must be valid.
         assert!(is_valid_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"));
     }

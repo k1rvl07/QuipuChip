@@ -787,6 +787,12 @@ fn fill_entry(doc: &Value, e: &mut Entry) -> Result<(), HttpError> {
             return Err(bad_request("totp_secret_invalid"));
         }
     }
+    if pm_core::totp::resolve_digits(e.get(Field::TotpDigits)).is_none() {
+        return Err(bad_request("totp_digits_invalid"));
+    }
+    if pm_core::totp::resolve_period(e.get(Field::TotpPeriod)).is_none() {
+        return Err(bad_request("totp_period_invalid"));
+    }
     Ok(())
 }
 
@@ -801,6 +807,8 @@ fn detail_body(e: &Entry) -> Result<Value, ()> {
         "note": field_checked(e, Field::Note)?,
         "tags": field_checked(e, Field::Tags)?,
         "totp": field_checked(e, Field::Totp)?,
+        "totpDigits": field_checked(e, Field::TotpDigits)?,
+        "totpPeriod": field_checked(e, Field::TotpPeriod)?,
         "hasPassword": !e.get(Field::Password).is_empty(),
         "hasTotp": !e.get(Field::Totp).is_empty(),
     }))
@@ -1178,6 +1186,7 @@ async fn entries_list(parts: RequestParts<'_>) -> Result<Outcome, HttpError> {
                 "login": field_list(e, Field::Login),
                 "url": field_list(e, Field::Url),
                 "tags": field_list(e, Field::Tags),
+                "hasPassword": !e.get(Field::Password).is_empty(),
                 "hasTotp": !e.get(Field::Totp).is_empty(),
             })
         })
@@ -1298,18 +1307,25 @@ async fn entry_totp(id: u32, parts: RequestParts<'_>) -> Result<Outcome, HttpErr
         log::error!("http: entry {id} totp secret unusable");
         return Err(internal("totp_secret_invalid"));
     };
-    // The secret passed `is_valid_secret` at write time; a failure here is
+    // Digits/period passed validation at write time; a failure here is
     // corruption, not user error.
-    let Ok(code) = pm_core::totp::compute(secret, u64::from(when)) else {
+    let (Some(digits), Some(period)) = (
+        pm_core::totp::resolve_digits(e.get(Field::TotpDigits)),
+        pm_core::totp::resolve_period(e.get(Field::TotpPeriod)),
+    ) else {
+        log::error!("http: entry {id} totp parameters unusable");
+        return Err(internal("totp_params_invalid"));
+    };
+    let Ok(code) = pm_core::totp::compute(secret, u64::from(when), digits, period) else {
         log::error!("http: entry {id} totp secret unusable");
         return Err(internal("totp_secret_invalid"));
     };
-    let period = pm_core::config::TOTP_PERIOD_SEC;
     Ok(json_outcome(
         200,
         json!({
             "ok": true,
             "code": code,
+            "digits": digits,
             "periodSec": period,
             "expiresInSec": period - (u64::from(when) % period),
         }),

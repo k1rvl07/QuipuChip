@@ -15,9 +15,20 @@ pub const PBKDF2_SALT_LEN: usize = 16;
 /// does not name the individual fields, so this keeps the same breakdown.
 pub const KDF_PARAMS_LEN: usize = 4 + 4 + 1 + PBKDF2_SALT_LEN;
 
-/// TOTP (RFC 6238): SHA1, 6 digits, 30 s, base32 secret string.
+/// TOTP (RFC 6238): SHA1, base32 secret string. Digits and period are stored
+/// per entry; the constants below are the defaults used when a record carries no
+/// explicit value (and keep the reference profile: 6 digits, 30 s).
 pub const TOTP_SECRET_MAX: usize = 64;
-/// Number of digits in a generated TOTP code.
+/// Default number of digits in a generated TOTP code.
 pub const TOTP_DIGITS: u32 = 6;
-/// TOTP time-step length in seconds.
+/// Default TOTP time-step length in seconds.
 pub const TOTP_PERIOD_SEC: u64 = 30;
+
+/// Smallest accepted digit count (RFC 4226/6238 standard profile).
+pub const TOTP_DIGITS_MIN: u32 = 6;
+/// Largest accepted digit count. `10^8` still fits `u32`.
+pub const TOTP_DIGITS_MAX: u32 = 8;
+/// Smallest accepted period.
+pub const TOTP_PERIOD_MIN_SEC: u64 = 10;
+/// Largest accepted period.
+pub const TOTP_PERIOD_MAX_SEC: u64 = 120;

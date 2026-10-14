@@ -2,15 +2,15 @@
 //!
 //! Ported from the removed C++ reference. The on-disk representation is a row of
 //! NUL-terminated fields written back-to-back with a fixed order:
-//! `title, login, password, url, note, tags, totp`. The fixed capacities below
-//! are part of the format: a `static_assert` in the C++ reference pins the payload
-//! at 1088 bytes (`sizeof(Entry) - sizeof(id)`), and `config::MAX_ENTRY_LEN`
-//! (1280) bounds it.
+//! `title, login, password, url, note, tags, totp, totpDigits, totpPeriod`. The
+//! fixed capacities below are part of the format; `config::MAX_ENTRY_LEN` (1280)
+//! bounds the serialized record.
 //!
-//! `tags` and `totp` were added in v0.2.0. Records written by older firmware
-//! carry only the first five fields; [`Entry::deserialize`] stops when the
-//! payload runs out and leaves the tail fields zeroed, so old records read back
-//! with empty `tags`/`totp`.
+//! `tags`/`totp` were added in v0.2.0, `totpDigits`/`totpPeriod` afterwards.
+//! Fields are positional, and [`Entry::deserialize`] stops when the payload runs
+//! out and leaves the tail fields zeroed, so records written by older firmware
+//! read back with the missing tail fields empty. An empty `totpDigits`/`totpPeriod`
+//! means "use the default profile" (6 digits, 30 s).
 
 /// `title` capacity, including the NUL terminator.
 pub const ENTRY_TITLE: usize = 48;
@@ -26,15 +26,26 @@ pub const ENTRY_NOTE: usize = 400;
 pub const ENTRY_TAGS: usize = 128;
 /// `totp` capacity, including the NUL terminator (v0.2.0+).
 pub const ENTRY_TOTP: usize = 64;
+/// `totpDigits` capacity, including the NUL terminator (decimal ASCII).
+pub const ENTRY_TOTP_DIGITS: usize = 4;
+/// `totpPeriod` capacity, including the NUL terminator (decimal ASCII seconds).
+pub const ENTRY_TOTP_PERIOD: usize = 8;
 
 /// Number of serialized fields, in on-disk order.
-pub const ENTRY_FIELDS: usize = 7;
+pub const ENTRY_FIELDS: usize = 9;
 
-/// `sizeof(Entry) - sizeof(id)`: the largest payload `serialize` can emit.
-pub const ENTRY_PAYLOAD_MAX: usize =
-    ENTRY_TITLE + ENTRY_LOGIN + ENTRY_PASSWORD + ENTRY_URL + ENTRY_NOTE + ENTRY_TAGS + ENTRY_TOTP;
+/// Largest payload `serialize` can emit.
+pub const ENTRY_PAYLOAD_MAX: usize = ENTRY_TITLE
+    + ENTRY_LOGIN
+    + ENTRY_PASSWORD
+    + ENTRY_URL
+    + ENTRY_NOTE
+    + ENTRY_TAGS
+    + ENTRY_TOTP
+    + ENTRY_TOTP_DIGITS
+    + ENTRY_TOTP_PERIOD;
 
-const _: () = assert!(ENTRY_PAYLOAD_MAX == 1088);
+const _: () = assert!(ENTRY_PAYLOAD_MAX == 1100);
 
 /// Field selector for [`Entry::get`] / [`Entry::set`]. `#[repr(u8)]` keeps the
 /// discriminant stable for indexing and logging.
@@ -55,6 +66,10 @@ pub enum Field {
     Tags = 5,
     /// TOTP secret (base32).
     Totp = 6,
+    /// TOTP digit count (decimal ASCII; empty = default).
+    TotpDigits = 7,
+    /// TOTP period in seconds (decimal ASCII; empty = default).
+    TotpPeriod = 8,
 }
 
 impl core::fmt::Display for Field {
@@ -67,6 +82,8 @@ impl core::fmt::Display for Field {
             Field::Note => "note",
             Field::Tags => "tags",
             Field::Totp => "totp",
+            Field::TotpDigits => "totpDigits",
+            Field::TotpPeriod => "totpPeriod",
         })
     }
 }
@@ -91,6 +108,10 @@ pub struct Entry {
     pub tags: [u8; ENTRY_TAGS],
     /// TOTP secret slot.
     pub totp: [u8; ENTRY_TOTP],
+    /// TOTP digit count slot (decimal ASCII; empty = default).
+    pub totp_digits: [u8; ENTRY_TOTP_DIGITS],
+    /// TOTP period slot (decimal ASCII seconds; empty = default).
+    pub totp_period: [u8; ENTRY_TOTP_PERIOD],
 }
 
 impl Default for Entry {
@@ -104,6 +125,8 @@ impl Default for Entry {
             note: [0; ENTRY_NOTE],
             tags: [0; ENTRY_TAGS],
             totp: [0; ENTRY_TOTP],
+            totp_digits: [0; ENTRY_TOTP_DIGITS],
+            totp_period: [0; ENTRY_TOTP_PERIOD],
         }
     }
 }
@@ -126,6 +149,8 @@ impl Entry {
             Field::Note => &self.note,
             Field::Tags => &self.tags,
             Field::Totp => &self.totp,
+            Field::TotpDigits => &self.totp_digits,
+            Field::TotpPeriod => &self.totp_period,
         }
     }
 
@@ -138,6 +163,8 @@ impl Entry {
             Field::Note => &mut self.note,
             Field::Tags => &mut self.tags,
             Field::Totp => &mut self.totp,
+            Field::TotpDigits => &mut self.totp_digits,
+            Field::TotpPeriod => &mut self.totp_period,
         }
     }
 
@@ -232,12 +259,14 @@ impl core::fmt::Debug for Entry {
             .field("note", &self.get_str(Field::Note).unwrap_or(""))
             .field("tags", &self.get_str(Field::Tags).unwrap_or(""))
             .field("totp", &self.get_str(Field::Totp).unwrap_or(""))
+            .field("totpDigits", &self.get_str(Field::TotpDigits).unwrap_or(""))
+            .field("totpPeriod", &self.get_str(Field::TotpPeriod).unwrap_or(""))
             .finish()
     }
 }
 
 /// `(JSON key, vault field)` in import/export order. Single source of truth for
-/// the seven entry fields; the binary order is derived from it below.
+/// the nine entry fields; the binary order is derived from it below.
 pub const FIELD_KEYS: &[(&str, Field)] = &[
     ("title", Field::Title),
     ("login", Field::Login),
@@ -246,9 +275,11 @@ pub const FIELD_KEYS: &[(&str, Field)] = &[
     ("note", Field::Note),
     ("tags", Field::Tags),
     ("totp", Field::Totp),
+    ("totpDigits", Field::TotpDigits),
+    ("totpPeriod", Field::TotpPeriod),
 ];
 
-/// The seven fields in binary record order, derived from [`FIELD_KEYS`].
+/// The nine fields in binary record order, derived from [`FIELD_KEYS`].
 pub const FIELD_ORDER: [Field; ENTRY_FIELDS] = {
     let mut out = [Field::Title; ENTRY_FIELDS];
     let mut i = 0;
@@ -283,12 +314,14 @@ mod tests {
         e.set(Field::Note, b"primary account");
         e.set(Field::Tags, b"work,email");
         e.set(Field::Totp, b"JBSWY3DPEHPK3PXP");
+        e.set(Field::TotpDigits, b"8");
+        e.set(Field::TotpPeriod, b"60");
         e
     }
 
     #[test]
-    fn payload_max_is_1088() {
-        assert_eq!(ENTRY_PAYLOAD_MAX, 1088);
+    fn payload_max_is_1100() {
+        assert_eq!(ENTRY_PAYLOAD_MAX, 1100);
     }
 
     #[test]
@@ -296,27 +329,44 @@ mod tests {
         let e = sample();
         let mut buf = [0u8; ENTRY_PAYLOAD_MAX];
         let n = e.serialize(&mut buf).unwrap();
-        // "Mail\0" (5) + 17 + 8 + 25 + 16 + 11 + 17 = 99
-        assert_eq!(n, 5 + 17 + 8 + 25 + 16 + 11 + 17);
+        // "Mail\0" (5) + 17 + 8 + 25 + 16 + 11 + 17 + "8\0" (2) + "60\0" (3) = 104
+        assert_eq!(n, 5 + 17 + 8 + 25 + 16 + 11 + 17 + 2 + 3);
         let back = Entry::deserialize(e.id, &buf[..n]);
         assert_eq!(back, e);
         assert_eq!(back.get_str(Field::Password).unwrap(), "hunter2");
+        assert_eq!(back.get_str(Field::TotpDigits).unwrap(), "8");
+        assert_eq!(back.get_str(Field::TotpPeriod).unwrap(), "60");
     }
 
     #[test]
     fn legacy_five_field_record_reads_tail_empty() {
-        // A record written before tags/totp existed.
+        // A record written before tags/totp/totpDigits/totpPeriod existed.
         let e = sample();
         let mut full = [0u8; ENTRY_PAYLOAD_MAX];
         let n = e.serialize(&mut full).unwrap();
-        // Trim the last two fields: name(11) + totp(17) bytes.
-        let legacy = &full[..n - 11 - 17];
+        // Trim the trailing four fields: tags(11) + totp(17) + digits(2) + period(3).
+        let legacy = &full[..n - 11 - 17 - 2 - 3];
         let back = Entry::deserialize(3, legacy);
         assert_eq!(back.id, 3);
         assert_eq!(back.get_str(Field::Title).unwrap(), "Mail");
         assert_eq!(back.get_str(Field::Note).unwrap(), "primary account");
         assert!(back.get(Field::Tags).is_empty());
         assert!(back.get(Field::Totp).is_empty());
+        assert!(back.get(Field::TotpDigits).is_empty());
+        assert!(back.get(Field::TotpPeriod).is_empty());
+    }
+
+    #[test]
+    fn legacy_seven_field_record_reads_digits_period_empty() {
+        // A v0.2.0 record: everything up to `totp`, no digits/period.
+        let e = sample();
+        let mut full = [0u8; ENTRY_PAYLOAD_MAX];
+        let n = e.serialize(&mut full).unwrap();
+        let legacy = &full[..n - 2 - 3];
+        let back = Entry::deserialize(9, legacy);
+        assert_eq!(back.get_str(Field::Totp).unwrap(), "JBSWY3DPEHPK3PXP");
+        assert!(back.get(Field::TotpDigits).is_empty());
+        assert!(back.get(Field::TotpPeriod).is_empty());
     }
 
     #[test]

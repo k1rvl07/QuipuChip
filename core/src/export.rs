@@ -44,7 +44,9 @@ const _: () = {
 };
 
 /// One entry as it appears on the wire. Field order is the serialization order
-/// serde emits and matches the C++ insertion order exactly.
+/// serde emits and matches the C++ insertion order exactly. `totpDigits` and
+/// `totpPeriod` default when absent, so documents written before they existed
+/// still import.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pmx1Entry {
     /// Entry title.
@@ -61,6 +63,12 @@ pub struct Pmx1Entry {
     pub tags: String,
     /// TOTP secret (base32).
     pub totp: String,
+    /// TOTP digit count (decimal ASCII; empty = default).
+    #[serde(default, rename = "totpDigits")]
+    pub totp_digits: String,
+    /// TOTP period in seconds (decimal ASCII; empty = default).
+    #[serde(default, rename = "totpPeriod")]
+    pub totp_period: String,
 }
 
 impl Pmx1Entry {
@@ -78,6 +86,8 @@ impl Pmx1Entry {
             note: s(Field::Note),
             tags: s(Field::Tags),
             totp: s(Field::Totp),
+            totp_digits: s(Field::TotpDigits),
+            totp_period: s(Field::TotpPeriod),
         }
     }
 
@@ -95,6 +105,8 @@ impl Pmx1Entry {
         e.set(Field::Note, self.note.as_bytes());
         e.set(Field::Tags, self.tags.as_bytes());
         e.set(Field::Totp, self.totp.as_bytes());
+        e.set(Field::TotpDigits, self.totp_digits.as_bytes());
+        e.set(Field::TotpPeriod, self.totp_period.as_bytes());
         e
     }
 }
@@ -151,6 +163,8 @@ pub enum ImportError {
     FieldTooLongOrNotString,
     /// A `totp` value was not a valid base32 secret.
     TotpSecretInvalid,
+    /// A `totpDigits`/`totpPeriod` value was not a valid number or out of range.
+    TotpParamsInvalid,
 }
 
 impl ImportError {
@@ -166,6 +180,7 @@ impl ImportError {
             ImportError::EntryNotAnObject => "entry_not_an_object",
             ImportError::FieldTooLongOrNotString => "field_too_long_or_not_a_string",
             ImportError::TotpSecretInvalid => "totp_secret_invalid",
+            ImportError::TotpParamsInvalid => "totp_params_invalid",
         }
     }
 }
@@ -222,6 +237,12 @@ pub fn parse_import(value: &Value) -> Result<Vec<Entry>, ImportError> {
                 .filter(|s| totp::is_valid_secret(s))
                 .ok_or(ImportError::TotpSecretInvalid)?;
         }
+        if totp::resolve_digits(e.get(Field::TotpDigits)).is_none() {
+            return Err(ImportError::TotpParamsInvalid);
+        }
+        if totp::resolve_period(e.get(Field::TotpPeriod)).is_none() {
+            return Err(ImportError::TotpParamsInvalid);
+        }
         out.push(e);
     }
     Ok(out)
@@ -252,6 +273,8 @@ mod tests {
         e.set(Field::Note, b"primary");
         e.set(Field::Tags, b"work");
         e.set(Field::Totp, b"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+        e.set(Field::TotpDigits, b"8");
+        e.set(Field::TotpPeriod, b"60");
         e
     }
 
@@ -260,7 +283,8 @@ mod tests {
         let json = encode_entry(&sample());
         let want = "{\"title\":\"Mail\",\"login\":\"user@example.com\",\
 \"password\":\"hunter2\",\"url\":\"https://mail.example.com\",\"note\":\"primary\",\
-\"tags\":\"work\",\"totp\":\"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\"}";
+\"tags\":\"work\",\"totp\":\"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\",\
+\"totpDigits\":\"8\",\"totpPeriod\":\"60\"}";
         assert_eq!(json, want);
         assert!(!json.contains("\"id\""));
     }
@@ -283,6 +307,40 @@ mod tests {
             back[0].get_str(Field::Totp).unwrap(),
             "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
         );
+        assert_eq!(back[0].get_str(Field::TotpDigits).unwrap(), "8");
+        assert_eq!(back[0].get_str(Field::TotpPeriod).unwrap(), "60");
+    }
+
+    #[test]
+    fn import_old_document_without_totp_params() {
+        // A document from before totpDigits/totpPeriod existed.
+        let doc: Value = serde_json::json!({
+            "format": "PMX1",
+            "version": 1,
+            "entries": [{"title": "T", "totp": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"}],
+        });
+        let back = parse_import(&doc).unwrap();
+        assert!(back[0].get(Field::TotpDigits).is_empty());
+        assert!(back[0].get(Field::TotpPeriod).is_empty());
+    }
+
+    #[test]
+    fn import_rejects_bad_totp_params() {
+        for bad in [
+            serde_json::json!({"title":"T","totpDigits":"9"}),
+            serde_json::json!({"title":"T","totpPeriod":"5"}),
+            serde_json::json!({"title":"T","totpPeriod":"abc"}),
+        ] {
+            let doc = serde_json::json!({
+                "format": "PMX1",
+                "version": 1,
+                "entries": [bad],
+            });
+            assert_eq!(
+                parse_import(&doc).unwrap_err(),
+                ImportError::TotpParamsInvalid
+            );
+        }
     }
 
     #[test]

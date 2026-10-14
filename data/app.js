@@ -7,6 +7,17 @@
   const POLL_MS = 300;
   const BASE32_RE = /^[A-Z2-7]+=*$/;
 
+  // Inline icons for the copy buttons. `currentColor` lets `.btn` theming apply.
+  const ICON_COPY =
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<rect x="9" y="9" width="11" height="11" rx="2"/>' +
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const ICON_CHECK =
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M20 6 9 17l-5-5"/></svg>';
+
   const state = {
     provisioned: false,
     unlocked: false,
@@ -20,13 +31,16 @@
     session: localStorage.getItem(SESSION_KEY) || '',
     entries: [],
     editingId: null,
+    originalPassword: '',
     viewId: null,
     masterShown: '',
     generatedKeyfileB64: '',
     keyfileSaved: false,
     inAuthFlow: 0,
     lockoutTimer: null,
-    totpTimer: null,
+    totpRaf: null,
+    cardTotpRaf: null,
+    cardTotpCells: [],
   };
 
   const RU = {
@@ -52,6 +66,9 @@
     totp_secret_invalid: 'TOTP-секрет не проходит проверку base32',
     totp_not_configured: 'TOTP не настроен для этой записи',
     time_required: 'Нет метки времени для TOTP',
+    totp_digits_invalid: 'Число цифр TOTP: от 6 до 8',
+    totp_period_invalid: 'Период TOTP: от 10 до 120 секунд',
+    totp_params_invalid: 'Параметры TOTP повреждены',
     format_required: 'Файл не в формате PMX1',
     version_unsupported: 'Версия формата файла не поддерживается',
     entries_required: 'В файле нет записей',
@@ -257,6 +274,7 @@
     }
     if (name !== 'app') {
       stopTotpTimer();
+      stopCardTotpTicker();
     }
   }
 
@@ -326,7 +344,68 @@
     return node;
   }
 
+  function iconBtn(inner, label) {
+    const btn = h('button', 'btn btn--ghost btn--sm btn--icon');
+    btn.type = 'button';
+    btn.innerHTML = inner;
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    return btn;
+  }
+
+  function markCopyButton(btn, label) {
+    btn.innerHTML = ICON_COPY;
+    btn.classList.add('btn--icon');
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+  }
+
+  // Password block shared by entry cards and the view modal: a masked value
+  // with show/hide and copy buttons. The secret is fetched lazily and cached.
+  function secretCred(getSecret, onError) {
+    const value = h('p', 'cred__value', '••••••••••••');
+    const actions = h('div', 'cred__actions');
+    let secret = null;
+    let shown = false;
+    const load = async () => {
+      if (secret === null) {
+        secret = await getSecret();
+      }
+      return secret;
+    };
+    const bToggle = h('button', 'btn btn--ghost btn--sm', 'Показать');
+    bToggle.type = 'button';
+    bToggle.addEventListener('click', async () => {
+      if (shown) {
+        value.textContent = '••••••••••••';
+        bToggle.textContent = 'Показать';
+        shown = false;
+        return;
+      }
+      try {
+        value.textContent = await load();
+        bToggle.textContent = 'Скрыть';
+        shown = true;
+      } catch (err) {
+        onError(err);
+      }
+    });
+    const bCopy = iconBtn(ICON_COPY, 'Копировать пароль');
+    bCopy.addEventListener('click', async () => {
+      try {
+        await copyText(await load(), bCopy);
+      } catch (err) {
+        onError(err);
+      }
+    });
+    actions.appendChild(bToggle);
+    actions.appendChild(bCopy);
+    return { value, actions };
+  }
+
   function render() {
+    stopCardTotpTicker();
+    state.cardTotpCells = [];
     const q = el('searchInput').value.trim().toLowerCase();
     const list = el('entriesList');
     list.textContent = '';
@@ -341,6 +420,7 @@
     for (const e of rows) {
       list.appendChild(card(e));
     }
+    startCardTotpTicker();
   }
 
   function card(e) {
@@ -351,10 +431,33 @@
 
     const meta = h('div', 'entry-card__meta');
     if (e.login) {
-      const row = h('div', 'entry-card__meta-row');
-      row.appendChild(h('span', 'entry-card__label', 'Логин'));
-      row.appendChild(h('span', 'entry-card__value entry-card__value--mono', e.login));
-      meta.appendChild(row);
+      const cred = h('div', 'cred');
+      const chead = h('div', 'cred__head');
+      chead.appendChild(h('div', 'cred__label', 'Логин'));
+      const cacts = h('div', 'cred__actions');
+      const bCopyLogin = iconBtn(ICON_COPY, 'Копировать логин');
+      bCopyLogin.addEventListener('click', () => copyText(e.login, bCopyLogin));
+      cacts.appendChild(bCopyLogin);
+      chead.appendChild(cacts);
+      cred.appendChild(chead);
+      cred.appendChild(h('p', 'cred__value', e.login));
+      meta.appendChild(cred);
+    }
+    if (e.hasPassword) {
+      const cred = h('div', 'cred');
+      const chead = h('div', 'cred__head');
+      chead.appendChild(h('div', 'cred__label', 'Пароль'));
+      const { value, actions: cacts } = secretCred(
+        async () => {
+          const r = await api(`/api/entries/${e.id}/secret`);
+          return r.data.password || '';
+        },
+        (err) => statusOf(el('appStatus'), 'error', errMsg(err.code)),
+      );
+      chead.appendChild(cacts);
+      cred.appendChild(chead);
+      cred.appendChild(value);
+      meta.appendChild(cred);
     }
     if (e.url) {
       const row = h('div', 'entry-card__meta-row');
@@ -362,16 +465,16 @@
       row.appendChild(h('span', 'entry-card__value', e.url));
       meta.appendChild(row);
     }
+    if (e.hasTotp) {
+      meta.appendChild(cardTotpBlock(e));
+    }
     box.appendChild(meta);
 
     const tagList = (e.tags || '').split(',').map((t) => t.trim()).filter(Boolean);
-    if (tagList.length || e.hasTotp) {
+    if (tagList.length) {
       const badges = h('div', 'entry-card__badges');
       for (const t of tagList.slice(0, 8)) {
         badges.appendChild(h('span', 'badge', t));
-      }
-      if (e.hasTotp) {
-        badges.appendChild(h('span', 'badge badge--totp', 'TOTP'));
       }
       box.appendChild(badges);
     }
@@ -385,12 +488,6 @@
     bEdit.addEventListener('click', () => openEdit(e.id));
     actions.appendChild(bView);
     actions.appendChild(bEdit);
-    if (e.login) {
-      const bCopy = h('button', 'btn btn--ghost btn--sm', 'Копировать логин');
-      bCopy.type = 'button';
-      bCopy.addEventListener('click', () => copyText(e.login, bCopy));
-      actions.appendChild(bCopy);
-    }
     box.appendChild(actions);
     return box;
   }
@@ -398,13 +495,7 @@
   async function copyText(text, btn) {
     try {
       await navigator.clipboard.writeText(text);
-      if (btn) {
-        const old = btn.textContent;
-        btn.textContent = 'Скопировано';
-        setTimeout(() => {
-          btn.textContent = old;
-        }, 1200);
-      }
+      flashCopied(btn);
     } catch (e) {
       const ta = document.createElement('textarea');
       ta.value = text;
@@ -412,7 +503,21 @@
       ta.select();
       document.execCommand('copy');
       ta.remove();
+      flashCopied(btn);
     }
+  }
+
+  function flashCopied(btn) {
+    if (!btn) {
+      return;
+    }
+    const old = btn.innerHTML;
+    btn.innerHTML = ICON_CHECK;
+    btn.classList.add('is-copied');
+    setTimeout(() => {
+      btn.innerHTML = old;
+      btn.classList.remove('is-copied');
+    }, 1200);
   }
 
   async function fileToB64(file) {
@@ -661,15 +766,20 @@
     const st = el('appStatus');
     hideStatus(st);
     state.editingId = id;
+    state.originalPassword = '';
     el('entryModalTitle').textContent = id ? 'Редактирование записи' : 'Новая запись';
     el('entryPasswordHint').hidden = !id;
     el('btnEntryDelete').hidden = !id;
     el('entryTitle').value = '';
     el('entryLogin').value = '';
     el('entryPassword').value = '';
+    el('entryPassword').type = 'password';
+    el('btnTogglePass').textContent = 'Показать';
     el('entryUrl').value = '';
     el('entryTags').value = '';
     el('entryTotp').value = '';
+    el('entryTotpDigits').value = '6';
+    el('entryTotpPeriod').value = '30';
     el('entryNote').value = '';
     el('genOpts').hidden = true;
     if (id) {
@@ -681,7 +791,12 @@
         el('entryUrl').value = d.url || '';
         el('entryTags').value = d.tags || '';
         el('entryTotp').value = d.totp || '';
+        el('entryTotpDigits').value = d.totpDigits || '6';
+        el('entryTotpPeriod').value = d.totpPeriod || '30';
         el('entryNote').value = d.note || '';
+        const s = await api(`/api/entries/${id}/secret`);
+        state.originalPassword = s.data.password || '';
+        el('entryPassword').value = state.originalPassword;
       } catch (e) {
         statusOf(st, 'error', `Не удалось открыть запись: ${errMsg(e.code)}`);
         return;
@@ -701,6 +816,22 @@
       statusOf(st, 'error', 'TOTP-секрет должен быть base32 (A–Z, 2–7)');
       return;
     }
+    let totpDigits = '';
+    let totpPeriod = '';
+    if (totp) {
+      const dg = Number(el('entryTotpDigits').value);
+      if (!Number.isInteger(dg) || dg < 6 || dg > 8) {
+        statusOf(st, 'error', 'Число цифр TOTP: от 6 до 8');
+        return;
+      }
+      const pd = Number(el('entryTotpPeriod').value);
+      if (!Number.isInteger(pd) || pd < 10 || pd > 120) {
+        statusOf(st, 'error', 'Период TOTP: от 10 до 120 секунд');
+        return;
+      }
+      totpDigits = String(dg);
+      totpPeriod = String(pd);
+    }
     const body = {
       title: el('entryTitle').value,
       login: el('entryLogin').value,
@@ -708,10 +839,15 @@
       note: el('entryNote').value,
       tags: el('entryTags').value,
       totp: totp,
+      totpDigits: totpDigits,
+      totpPeriod: totpPeriod,
     };
     const pw = el('entryPassword').value;
-    if (pw) {
+    if (pw !== state.originalPassword) {
       body.password = pw;
+    }
+    if (state.editingId && !window.confirm('Сохранить изменения в записи?')) {
+      return;
     }
     const btn = el('btnEntrySave');
     btn.disabled = true;
@@ -775,31 +911,34 @@
       body.appendChild(wrap);
     };
 
-    row('Логин', d.login, true);
+    if (d.login) {
+      const cred = h('div', 'cred');
+      const chead = h('div', 'cred__head');
+      chead.appendChild(h('div', 'cred__label', 'Логин'));
+      const cacts = h('div', 'cred__actions');
+      const bCopyLogin = iconBtn(ICON_COPY, 'Копировать логин');
+      bCopyLogin.addEventListener('click', () => copyText(d.login, bCopyLogin));
+      cacts.appendChild(bCopyLogin);
+      chead.appendChild(cacts);
+      cred.appendChild(chead);
+      cred.appendChild(h('p', 'cred__value', d.login));
+      body.appendChild(cred);
+    }
     if (d.hasPassword) {
-      const wrap = h('div', 'view-row');
-      wrap.appendChild(h('div', 'view-row__label', 'Пароль'));
-      const val = h('p', 'view-row__value view-row__value--mono', '••••••••••••');
-      wrap.appendChild(val);
-      const actions = h('div', 'view-actions');
-      const bReveal = h('button', 'btn btn--ghost btn--sm', 'Показать пароль');
-      bReveal.type = 'button';
-      bReveal.addEventListener('click', async () => {
-        try {
+      const cred = h('div', 'cred');
+      const chead = h('div', 'cred__head');
+      chead.appendChild(h('div', 'cred__label', 'Пароль'));
+      const { value, actions: cacts } = secretCred(
+        async () => {
           const r = await api(`/api/entries/${id}/secret`);
-          val.textContent = r.data.password || '';
-          bReveal.remove();
-          const bCopy = h('button', 'btn btn--ghost btn--sm', 'Скопировать');
-          bCopy.type = 'button';
-          bCopy.addEventListener('click', () => copyText(r.data.password || '', bCopy));
-          actions.appendChild(bCopy);
-        } catch (e2) {
-          statusOf(st, 'error', errMsg(e2.code));
-        }
-      });
-      actions.appendChild(bReveal);
-      wrap.appendChild(actions);
-      body.appendChild(wrap);
+          return r.data.password || '';
+        },
+        (err) => statusOf(st, 'error', errMsg(err.code)),
+      );
+      chead.appendChild(cacts);
+      cred.appendChild(chead);
+      cred.appendChild(value);
+      body.appendChild(cred);
     }
     if (d.url) {
       const wrap = h('div', 'view-row');
@@ -850,33 +989,284 @@
   }
 
   function stopTotpTimer() {
-    if (state.totpTimer) {
-      clearInterval(state.totpTimer);
-      state.totpTimer = null;
+    if (state.totpRaf) {
+      cancelAnimationFrame(state.totpRaf);
+      state.totpRaf = null;
     }
   }
 
+  // Same deadline-driven design as the entry cards: the window boundary comes
+  // from the device response, the next window is prefetched before the rollover,
+  // and painting runs on requestAnimationFrame so the swap is not delayed by a
+  // throttled interval.
   function refreshTotp(id, codeNode, metaNode) {
     stopTotpTimer();
-    let left = 0;
-    const tick = async () => {
-      if (left <= 0) {
-        try {
-          const r = await api(`/api/entries/${id}/totp?t=${Math.floor(Date.now() / 1000)}`);
-          codeNode.textContent = r.data.code || '------';
-          left = r.data.expiresInSec || 30;
-        } catch (e) {
-          codeNode.textContent = '------';
-          metaNode.textContent = errMsg(e.code);
-          stopTotpTimer();
+    let boundary = 0;
+    let next = null;
+    let pending = false;
+    let retryAt = 0;
+    let lastSecs = -1;
+
+    async function load(at) {
+      const r = await api(`/api/entries/${id}/totp?t=${at}`);
+      const period = r.data.periodSec || 30;
+      return {
+        code: r.data.code || '------',
+        boundary: at * 1000 + (r.data.expiresInSec || period) * 1000,
+      };
+    }
+
+    async function fetchNow(at) {
+      if (pending) {
+        return;
+      }
+      pending = true;
+      try {
+        const win = await load(at);
+        codeNode.textContent = win.code;
+        boundary = win.boundary;
+        next = null;
+        retryAt = 0;
+        lastSecs = -1;
+      } catch (e) {
+        codeNode.textContent = '------';
+        metaNode.textContent = errMsg(e.code);
+        stopTotpTimer();
+      } finally {
+        pending = false;
+      }
+    }
+
+    async function prefetch() {
+      if (pending || next) {
+        return;
+      }
+      const target = boundary;
+      pending = true;
+      try {
+        const win = await load(Math.floor(target / 1000));
+        if (boundary !== target) {
           return;
         }
+        next = win;
+      } catch (e) {
+        // Leave `next` empty; the rollover falls back to a normal fetch.
+      } finally {
+        pending = false;
       }
-      left -= 1;
-      metaNode.textContent = `обновится через ${Math.max(left, 0)} с`;
-    };
-    tick();
-    state.totpTimer = setInterval(tick, 1000);
+    }
+
+    function frame() {
+      const now = Date.now();
+      if (boundary && now < boundary) {
+        const rem = boundary - now;
+        const secs = Math.ceil(rem / 1000);
+        if (lastSecs !== secs) {
+          lastSecs = secs;
+          metaNode.textContent = `обновится через ${secs} с`;
+        }
+        if (rem <= CARD_TOTP_PREFETCH_MS) {
+          prefetch();
+        }
+      } else if (next) {
+        codeNode.textContent = next.code;
+        boundary = next.boundary;
+        next = null;
+        lastSecs = -1;
+      } else if (now >= retryAt) {
+        retryAt = now + CARD_TOTP_RETRY_MS;
+        fetchNow(Math.floor(now / 1000));
+      }
+      state.totpRaf = requestAnimationFrame(frame);
+    }
+
+    fetchNow(Math.floor(Date.now() / 1000));
+    state.totpRaf = requestAnimationFrame(frame);
+  }
+
+  // ── TOTP codes on entry cards ───────────────────────────────────────────────
+  // One shared animation loop repaints every visible card that carries a TOTP
+  // secret. Each cell keeps its own window boundary, so periods may differ per
+  // entry and the bar always reaches empty exactly at the boundary. Painting on
+  // requestAnimationFrame keeps the bar smooth and detects the rollover within a
+  // frame, instead of waiting up to a whole interval tick (which made the cycle
+  // hang ~1 s when the browser throttled setInterval).
+
+  const CARD_TOTP_RETRY_MS = 2000;
+  const CARD_TOTP_PREFETCH_MS = 2000;
+
+  function cardTotpBlock(e) {
+    const cred = h('div', 'cred');
+    const chead = h('div', 'cred__head');
+    chead.appendChild(h('div', 'cred__label', 'TOTP'));
+    const cacts = h('div', 'cred__actions');
+    const codeNode = h('p', 'cred__value card-totp__code', '······');
+    const bCopy = iconBtn(ICON_COPY, 'Копировать код TOTP');
+    bCopy.disabled = true;
+    bCopy.addEventListener('click', () => copyText(codeNode.textContent, bCopy));
+    cacts.appendChild(bCopy);
+    chead.appendChild(cacts);
+    const barWrap = h('div', 'card-totp__bar');
+    const bar = h('span', 'card-totp__bar-fill');
+    barWrap.appendChild(bar);
+    const meta = h('p', 'card-totp__meta', '');
+    cred.appendChild(chead);
+    cred.appendChild(codeNode);
+    cred.appendChild(barWrap);
+    cred.appendChild(meta);
+    state.cardTotpCells.push({
+      id: e.id,
+      codeNode,
+      bar,
+      meta,
+      copyBtn: bCopy,
+      period: 0,
+      boundary: 0,
+      hasCode: false,
+      pending: false,
+      retryAt: 0,
+      lastSecs: -1,
+      next: null,
+    });
+    return cred;
+  }
+
+  // Absolute window boundary (ms) drives both the bar and the countdown, so the
+  // local timer stays aligned with the device even if the fetch was slow.
+  function paintCardTotp(cell) {
+    const period = cell.period > 0 ? cell.period : 30;
+    const rem = Math.max(0, cell.boundary - Date.now());
+    const pct = Math.max(0, Math.min(100, (rem / (period * 1000)) * 100));
+    cell.bar.style.width = `${pct}%`;
+    const secs = Math.ceil(rem / 1000);
+    if (cell.lastSecs !== secs) {
+      cell.lastSecs = secs;
+      cell.meta.textContent = `обновится через ${secs} с`;
+    }
+  }
+
+  function paintCardTotpExpired(cell) {
+    cell.bar.style.width = '0%';
+    if (cell.lastSecs !== 0) {
+      cell.lastSecs = 0;
+      cell.meta.textContent = 'обновляется…';
+    }
+  }
+
+  async function fetchCardTotp(cell) {
+    if (cell.pending) {
+      return;
+    }
+    cell.pending = true;
+    const sent = Date.now();
+    try {
+      const r = await api(`/api/entries/${cell.id}/totp?t=${Math.floor(sent / 1000)}`);
+      if (!state.cardTotpCells.includes(cell)) {
+        return;
+      }
+      cell.codeNode.textContent = r.data.code || '······';
+      cell.period = r.data.periodSec || 30;
+      cell.boundary =
+        Math.floor(sent / 1000) * 1000 + (r.data.expiresInSec || cell.period) * 1000;
+      cell.copyBtn.disabled = false;
+      cell.hasCode = true;
+      cell.retryAt = 0;
+      cell.lastSecs = -1;
+      cell.next = null;
+      paintCardTotp(cell);
+    } catch (err) {
+      if (!state.cardTotpCells.includes(cell)) {
+        return;
+      }
+      cell.codeNode.textContent = '······';
+      cell.copyBtn.disabled = true;
+      cell.hasCode = false;
+      cell.boundary = 0;
+      cell.lastSecs = 0;
+      cell.retryAt = Date.now() + CARD_TOTP_RETRY_MS;
+      cell.bar.style.width = '0%';
+      cell.meta.textContent = errMsg(err.code);
+    } finally {
+      cell.pending = false;
+    }
+  }
+
+  // The device closes idle keep-alive sockets after ~1 s, so a fetch issued at
+  // the rollover always pays a fresh TLS handshake (~0.8 s) and the bar sits
+  // empty. Ask the device for the *next* window a couple of seconds early
+  // (TOTP is stateless, `t` may be in the future) and stage it for a local swap.
+  async function prefetchCardTotp(cell) {
+    if (cell.pending || cell.next) {
+      return;
+    }
+    const target = cell.boundary;
+    cell.pending = true;
+    try {
+      const r = await api(`/api/entries/${cell.id}/totp?t=${Math.floor(target / 1000)}`);
+      if (!state.cardTotpCells.includes(cell) || cell.boundary !== target) {
+        return;
+      }
+      const period = r.data.periodSec || cell.period || 30;
+      cell.next = {
+        code: r.data.code || '······',
+        boundary: Math.floor(target / 1000) * 1000 + (r.data.expiresInSec || period) * 1000,
+      };
+    } catch (err) {
+      // Leave `next` empty; the rollover falls back to a normal fetch.
+    } finally {
+      cell.pending = false;
+    }
+  }
+
+  function promoteCardTotp(cell) {
+    cell.codeNode.textContent = cell.next.code;
+    cell.boundary = cell.next.boundary;
+    cell.next = null;
+    cell.hasCode = true;
+    cell.retryAt = 0;
+    cell.lastSecs = -1;
+    cell.copyBtn.disabled = false;
+    paintCardTotp(cell);
+  }
+
+  function cardTotpFrame() {
+    const now = Date.now();
+    for (const cell of state.cardTotpCells) {
+      const rem = cell.boundary - now;
+      if (cell.hasCode && rem > 0) {
+        paintCardTotp(cell);
+        if (rem <= CARD_TOTP_PREFETCH_MS) {
+          prefetchCardTotp(cell);
+        }
+      } else if (cell.next) {
+        promoteCardTotp(cell);
+      } else {
+        paintCardTotpExpired(cell);
+        if (now >= cell.retryAt) {
+          fetchCardTotp(cell);
+        }
+      }
+    }
+  }
+
+  function cardTotpLoop() {
+    cardTotpFrame();
+    state.cardTotpRaf = requestAnimationFrame(cardTotpLoop);
+  }
+
+  function startCardTotpTicker() {
+    if (state.cardTotpRaf || state.cardTotpCells.length === 0) {
+      return;
+    }
+    cardTotpFrame();
+    state.cardTotpRaf = requestAnimationFrame(cardTotpLoop);
+  }
+
+  function stopCardTotpTicker() {
+    if (state.cardTotpRaf) {
+      cancelAnimationFrame(state.cardTotpRaf);
+      state.cardTotpRaf = null;
+    }
   }
 
   async function rekeyGenPhrase() {
@@ -1222,23 +1612,40 @@
         continue;
       }
       let totp = '';
+      let totpDigits = '';
+      let totpPeriod = '';
       const otp = kdbxField(f, 'otp');
       if (otp) {
-        const secret = otp.indexOf('otpauth://') === 0
-          ? (function () {
-              try {
-                return new URL(otp).searchParams.get('secret') || '';
-              } catch (err) {
-                return '';
+        let secret = otp;
+        if (otp.indexOf('otpauth://') === 0) {
+          try {
+            const params = new URL(otp).searchParams;
+            secret = params.get('secret') || '';
+            const d = params.get('digits') || '';
+            const p = params.get('period') || '';
+            if (d === '6' || d === '7' || d === '8') {
+              totpDigits = d;
+            }
+            if (/^\d+$/.test(p)) {
+              const n = Number(p);
+              if (n >= 10 && n <= 120) {
+                totpPeriod = p;
               }
-            })()
-          : otp;
+            }
+          } catch (err) {
+            secret = '';
+          }
+        }
         const norm = secret.toUpperCase();
         if (BASE32_RE.test(norm)) {
           totp = norm;
         }
       }
-      entries.push({ title: finalTitle, login, password, url, note, tags, totp });
+      if (!totp) {
+        totpDigits = '';
+        totpPeriod = '';
+      }
+      entries.push({ title: finalTitle, login, password, url, note, tags, totp, totpDigits, totpPeriod });
     }
     return { entries, skipped, truncated };
   }
@@ -1408,9 +1815,11 @@
           en.fields.set('Tags', it.tags);
         }
         if (it.totp) {
+          const digits = it.totpDigits || '6';
+          const period = it.totpPeriod || '30';
           en.fields.set(
             'otp',
-            `otpauth://totp/${encodeURIComponent(it.title || 'entry')}?secret=${it.totp}&digits=6&period=30`
+            `otpauth://totp/${encodeURIComponent(it.title || 'entry')}?secret=${it.totp}&digits=${digits}&period=${period}`
           );
         }
       }
@@ -1442,6 +1851,8 @@
 
   function wire() {
     el('btnProvision').addEventListener('click', doProvision);
+    markCopyButton(el('btnCopyMaster'), 'Скопировать мастер-пароль');
+    markCopyButton(el('btnCopyPass'), 'Скопировать пароль');
     el('btnCopyMaster').addEventListener('click', () => copyText(state.masterShown, el('btnCopyMaster')));
     el('btnHideMaster').addEventListener('click', toggleMaster);
     el('btnDoneMaster').addEventListener('click', async () => {
@@ -1495,20 +1906,24 @@
 
     el('btnEntryClose').addEventListener('click', () => el('modalEntry').close());
     el('btnEntryCancel').addEventListener('click', () => el('modalEntry').close());
+    el('modalEntry').addEventListener('close', () => {
+      state.editingId = null;
+      state.originalPassword = '';
+    });
     el('formEntry').addEventListener('submit', saveEntry);
     el('btnEntryDelete').addEventListener('click', deleteEntry);
-    el('btnGenPass').addEventListener('click', () => {
-      el('genOpts').hidden = false;
+    function generateIntoField() {
       el('entryPassword').value = generatePassword();
       el('entryPassword').type = 'text';
       el('btnTogglePass').textContent = 'Скрыть';
+    }
+    el('btnGenPass').addEventListener('click', () => {
+      el('genOpts').hidden = false;
     });
+    el('btnGenAgain').addEventListener('click', generateIntoField);
     for (const id of ['genUpper', 'genLower', 'genDigits', 'genSym', 'genLen']) {
       el(id).addEventListener('input', () => {
         el('genLenVal').textContent = el('genLen').value;
-        if (!el('genOpts').hidden) {
-          el('entryPassword').value = generatePassword();
-        }
       });
     }
     el('btnGenPhrase').addEventListener('click', async () => {
