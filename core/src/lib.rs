@@ -1,4 +1,4 @@
-//! Portable core for the PassManager firmware.
+//! Portable core for the QuipuChip firmware.
 //!
 //! Everything here must build and be testable on the host, without any ESP-IDF
 //! or hardware dependency. Board-specific code lives in the `firmware-embassy`
@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod api;
 pub mod auth;
 pub mod base64;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod rand;
 pub mod totp;
 pub mod types;
 pub mod vault;
+pub mod webpath;
 pub mod wordlist;
 
 #[cfg(any(test, feature = "test-utils"))]

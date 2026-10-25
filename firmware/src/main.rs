@@ -1,4 +1,4 @@
-//! PassManager firmware — pure-Rust (esp-hal + embassy) boot path.
+//! QuipuChip firmware — pure-Rust (esp-hal + embassy) boot path.
 //!
 //! Brings up the heap (internal DRAM + PSRAM), mounts the `vault` partition
 //! through `esp-storage`, restores the vault's provisioned state, then starts
@@ -194,8 +194,8 @@ async fn main(spawner: Spawner) -> ! {
     config.bcd_usb = embassy_usb::UsbVersion::Two;
     config.device_release = 0x0100;
     config.supports_remote_wakeup = true;
-    config.manufacturer = Some("PassManager");
-    config.product = Some("PassManager NCM");
+    config.manufacturer = Some("QuipuChip");
+    config.product = Some("QuipuChip NCM");
     config.serial_number = Some("");
 
     let mut usb_builder = Builder::new(

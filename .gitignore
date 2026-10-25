@@ -10,6 +10,16 @@ target/
 
 # Python
 __pycache__/
+*.pyc
+
+# Node (KDBX compatibility harness)
+node_modules/
+npm-debug.log*
+
+# Generated KDBX fixtures (rebuild with scripts/kdbx_fixtures.sh)
+tests/kdbx/fixtures/*.kdbx
+tests/kdbx/fixtures/*.key
+tests/kdbx/fixtures/*.json
 
 # PlatformIO (legacy)
 .pio

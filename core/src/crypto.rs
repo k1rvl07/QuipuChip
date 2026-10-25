@@ -325,4 +325,109 @@ mod tests {
         assert!(ct_equal(&[1, 2, 3, 4], &[1, 2, 3, 4]));
         assert!(!ct_equal(&[1, 2, 3], &[1, 2, 3, 4]));
     }
+
+    #[test]
+    fn ct_equal_on_empty_slices() {
+        assert!(ct_equal(&[], &[]));
+    }
+
+    #[test]
+    fn wipe_zeroes_the_buffer() {
+        let mut buf = [0xABu8; 16];
+        wipe(&mut buf);
+        assert_eq!(buf, [0u8; 16]);
+        // Wiping an empty buffer must not panic.
+        wipe(&mut []);
+    }
+
+    #[test]
+    fn cipher_error_messages() {
+        let cases = [
+            (CipherError::Ok, "ok"),
+            (CipherError::InvalidArg, "invalid argument"),
+            (CipherError::InvalidKeyLen, "invalid key length"),
+            (CipherError::InvalidIvLen, "invalid iv length"),
+            (CipherError::InvalidTagLen, "invalid tag length"),
+            (CipherError::AuthFail, "authentication failed"),
+            (CipherError::EncryptFail, "encrypt failed"),
+            (CipherError::DecryptFail, "decrypt failed"),
+        ];
+        for (err, text) in cases {
+            assert_eq!(err.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn aes_gcm_encrypt_rejects_bad_parameters() {
+        let key = [0u8; 32];
+        let iv = [0u8; 12];
+        let mut buf = [0u8; 8];
+
+        // Empty plaintext is refused: the reference has no use for it and a
+        // zero-length buffer would make an empty record indistinguishable from
+        // a failed write.
+        assert_eq!(
+            aes_gcm_encrypt(&key, &iv, &[], &mut []),
+            Err(CipherError::InvalidArg)
+        );
+        // Wrong IV length.
+        assert_eq!(
+            aes_gcm_encrypt(&key, &[0u8; 11], &[], &mut buf),
+            Err(CipherError::InvalidIvLen)
+        );
+        assert_eq!(
+            aes_gcm_encrypt(&key, &[0u8; 13], &[], &mut buf),
+            Err(CipherError::InvalidIvLen)
+        );
+        // Wrong key length.
+        assert_eq!(
+            aes_gcm_encrypt(&[0u8; 16], &iv, &[], &mut buf),
+            Err(CipherError::InvalidKeyLen)
+        );
+    }
+
+    #[test]
+    fn aes_gcm_decrypt_rejects_bad_parameters() {
+        let key = [0u8; 32];
+        let iv = [0u8; 12];
+        let tag = [0u8; 16];
+        let mut buf = [0u8; 8];
+
+        assert_eq!(
+            aes_gcm_decrypt(&key, &iv, &[], &mut [], &tag),
+            Err(CipherError::InvalidArg)
+        );
+        assert_eq!(
+            aes_gcm_decrypt(&key, &[0u8; 11], &[], &mut buf, &tag),
+            Err(CipherError::InvalidIvLen)
+        );
+        assert_eq!(
+            aes_gcm_decrypt(&key, &iv, &[], &mut buf, &[0u8; 15]),
+            Err(CipherError::InvalidTagLen)
+        );
+        assert_eq!(
+            aes_gcm_decrypt(&key, &iv, &[], &mut buf, &[0u8; 17]),
+            Err(CipherError::InvalidTagLen)
+        );
+        assert_eq!(
+            aes_gcm_decrypt(&[0u8; 16], &iv, &[], &mut buf, &tag),
+            Err(CipherError::InvalidKeyLen)
+        );
+    }
+
+    #[test]
+    fn aes_gcm_rejects_a_truncated_or_extended_key() {
+        // 32 bytes is AES-256; anything else must be refused rather than
+        // silently padded, because the vault derives a fixed-size key.
+        let iv = [0u8; 12];
+        let mut buf = [0u8; 8];
+        for len in [0usize, 1, 15, 16, 24, 31, 33, 64] {
+            let key = vec![0u8; len];
+            assert_eq!(
+                aes_gcm_encrypt(&key, &iv, &[], &mut buf),
+                Err(CipherError::InvalidKeyLen),
+                "key length {len}"
+            );
+        }
+    }
 }

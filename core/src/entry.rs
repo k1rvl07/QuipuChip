@@ -248,6 +248,10 @@ impl Entry {
     }
 }
 
+// The lint compares field names verbatim and does not see that
+// `totp_digits` is printed as `totpDigits`: the debug output deliberately
+// uses the JSON field names and redacts the password slot.
+#[allow(clippy::missing_fields_in_debug)]
 impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Entry")
@@ -384,5 +388,86 @@ mod tests {
         let e = sample();
         let mut small = [0u8; 16];
         assert!(e.serialize(&mut small).is_none());
+    }
+
+    #[test]
+    fn a_new_entry_is_all_zero() {
+        let e = Entry::new();
+        assert_eq!(e.id, 0);
+        for field in FIELD_ORDER {
+            assert!(e.get(field).is_empty(), "{field} is not empty");
+        }
+    }
+
+    #[test]
+    fn field_keys_and_field_order_agree() {
+        // FIELD_ORDER is derived from FIELD_KEYS; a mismatch would serialize
+        // the fields in a different order than the JSON document lists them.
+        assert_eq!(FIELD_KEYS.len(), ENTRY_FIELDS);
+        for (i, (_key, field)) in FIELD_KEYS.iter().enumerate() {
+            assert_eq!(FIELD_ORDER[i], *field);
+        }
+        // The JSON key names are the wire contract.
+        let keys: Vec<&str> = FIELD_KEYS.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "title",
+                "login",
+                "password",
+                "url",
+                "note",
+                "tags",
+                "totp",
+                "totpDigits",
+                "totpPeriod"
+            ]
+        );
+    }
+
+    #[test]
+    fn field_display_matches_the_json_key() {
+        for (key, field) in FIELD_KEYS {
+            assert_eq!(field.to_string(), *key);
+        }
+    }
+
+    #[test]
+    fn get_str_rejects_invalid_utf8() {
+        // The vault stores raw bytes; only the HTTP path guarantees UTF-8.
+        // A corrupted slot must be reported, not silently mangled.
+        let mut e = Entry::new();
+        e.title[0] = 0xFF;
+        assert!(e.get_str(Field::Title).is_err());
+    }
+
+    #[test]
+    fn set_leaves_no_stale_bytes_behind() {
+        // Shrinking a field must clear the tail, otherwise a later read would
+        // see the remains of the previous value.
+        let mut e = Entry::new();
+        e.set(Field::Title, b"a-long-title-value");
+        e.set(Field::Title, b"short");
+        assert_eq!(e.get_str(Field::Title).unwrap(), "short");
+        assert!(e.raw(Field::Title)[5..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn set_with_an_empty_value_clears_the_field() {
+        let mut e = Entry::new();
+        e.set(Field::Note, b"something");
+        e.set(Field::Note, b"");
+        assert!(e.get(Field::Note).is_empty());
+    }
+
+    #[test]
+    fn serialize_is_exact_and_rejects_a_buffer_one_byte_short() {
+        let e = sample();
+        let mut buf = [0u8; ENTRY_PAYLOAD_MAX];
+        let n = e.serialize(&mut buf).unwrap();
+        assert!(e.serialize(&mut buf[..n - 1]).is_none());
+        assert!(e.serialize(&mut buf[..n]).is_some());
+        // The payload is a sequence of NUL-terminated strings.
+        assert_eq!(buf[n - 1], 0);
     }
 }

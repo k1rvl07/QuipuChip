@@ -5,7 +5,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
-  <title>Установка сертификата — PassManager</title>
+  <title>Install Certificate — QuipuChip</title>
   <link rel="icon" href="data:," />
   <style>
     :root {
@@ -153,31 +153,31 @@
 
 <body>
   <div class="container">
-    <h1>Установка сертификата <span class="brand">PassManager</span></h1>
-    <p class="muted">Устройство использует собственный корневой сертификат (CA). Чтобы браузер открывал
-      <code>https://192.168.7.1/</code> без предупреждения, добавьте этот сертификат в доверенные на своём
-      компьютере. До этого веб-интерфейс хранилища по сети недоступен — отдаётся только эта страница.</p>
+    <h1>Install Certificate <span class="brand">QuipuChip</span></h1>
+    <p class="muted">The device uses its own root certificate (CA). To open <code>https://192.168.7.1/</code> in your
+      browser without warnings, add this certificate to your trusted store. Until then, only this page is available over
+      the network.</p>
 
     <div class="actions">
-      <a class="btn btn--primary" href="/ca.pem" download="PassManager-CA.pem">Скачать PEM</a>
-      <a class="btn" href="/ca.crt" download="PassManager-CA.crt">Скачать CRT (DER)</a>
+      <a class="btn btn--primary" href="/ca.pem" download="QuipuChip-CA.pem">Download PEM</a>
+      <a class="btn" href="/ca.crt" download="QuipuChip-CA.crt">Download CRT (DER)</a>
     </div>
 
     <div class="fingerprint" id="certFingerprint" hidden>
-      <span>SHA-256 отпечаток CA: </span><code id="certFingerprintValue"></code>
+      <span>SHA-256 CA fingerprint: </span><code id="certFingerprintValue"></code>
     </div>
 
     <details open>
       <summary>Linux — Chrome / Chromium (через NSS)</summary>
       <ol>
-        <li>Установите утилиту <code>certutil</code>: в Arch/CachyOS — пакет <code>nss</code>, в Debian/Ubuntu —
+        <li>Install <code>certutil</code>: в Arch/CachyOS — пакет <code>nss</code>, в Debian/Ubuntu —
           <code>libnss3-tools</code>.</li>
-        <li>Добавьте сертификат в хранилище NSS браузера (файл <code>.crt</code> — это DER):
-          <pre>certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "PassManager CA" -i PassManager-CA.crt</pre>
-          Если используете файл <code>PassManager-CA.pem</code>, добавьте флаг <code>-a</code>.
+        <li>Add the certificate в хранилище NSS браузера (файл <code>.crt</code> — это DER):
+          <pre>certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "QuipuChip CA" -i QuipuChip-CA.crt</pre>
+          If you use the <code>QuipuChip-CA.pem</code> file, add the <code>-a</code> flag.
         </li>
-        <li>Либо через интерфейс: откройте <code>chrome://settings/certificates</code> → «Центры сертификации» →
-          «Импорт» → выберите <code>PassManager-CA.crt</code> и включите доверие к сайтам.</li>
+        <li>Or via UI: open <code>chrome://settings/certificates</code> → Authorities → Import → select
+          <code>QuipuChip-CA.crt</code> and trust for websites.</li>
         <li>Полностью перезапустите Chrome.</li>
       </ol>
     </details>
@@ -186,17 +186,17 @@
       <summary>Linux — системное хранилище (curl, openssl и др.)</summary>
       <ol>
         <li><strong>Arch / CachyOS / Manjaro:</strong>
-          <pre>sudo trust anchor PassManager-CA.crt</pre>
-          Или положите сертификат в <code>/etc/ca-certificates/trust-source/anchors/</code> и выполните
+          <pre>sudo trust anchor QuipuChip-CA.crt</pre>
+          Or place the certificate in <code>/etc/ca-certificates/trust-source/anchors/</code> and run
           <code>sudo update-ca-trust</code>.
         </li>
         <li><strong>Debian / Ubuntu:</strong>
           <pre>sudo mkdir -p /usr/local/share/ca-certificates
-sudo cp PassManager-CA.crt /usr/local/share/ca-certificates/PassManager-CA.crt
+sudo cp QuipuChip-CA.crt /usr/local/share/ca-certificates/QuipuChip-CA.crt
 sudo update-ca-certificates</pre>
         </li>
         <li><strong>Fedora / RHEL:</strong>
-          <pre>sudo cp PassManager-CA.pem /etc/pki/ca-trust/source/anchors/
+          <pre>sudo cp QuipuChip-CA.pem /etc/pki/ca-trust/source/anchors/
 sudo update-ca-trust</pre>
         </li>
       </ol>
@@ -205,8 +205,8 @@ sudo update-ca-trust</pre>
     <details>
       <summary>Firefox (любая ОС)</summary>
       <ol>
-        <li>Откройте <code>about:preferences#privacy</code> → «Сертификаты» → «Просмотр сертификатов».</li>
-        <li>Раздел «Центры сертификации» → «Импортировать» → выберите <code>PassManager-CA.pem</code>.</li>
+        <li>Open <code>about:preferences#privacy</code> → Certificates → View Certificates.</li>
+        <li>Раздел «Центры сертификации» → «Импортировать» → выберите <code>QuipuChip-CA.pem</code>.</li>
         <li>Отметьте «Доверять при идентификации веб-сайтов» и подтвердите.</li>
       </ol>
     </details>
@@ -214,10 +214,10 @@ sudo update-ca-trust</pre>
     <details>
       <summary>Windows — Chrome / Edge</summary>
       <ol>
-        <li>Дважды щёлкните <code>PassManager-CA.crt</code> → «Установить сертификат».</li>
+        <li>Double-click <code>QuipuChip-CA.crt</code> → Install Certificate.</li>
         <li>Разместите его в хранилище «Доверенные корневые центры сертификации».</li>
         <li>Либо из командной строки:
-          <pre>certutil -addstore -user Root PassManager-CA.crt</pre>
+          <pre>certutil -addstore -user Root QuipuChip-CA.crt</pre>
         </li>
         <li>Перезапустите браузер.</li>
       </ol>
@@ -226,10 +226,10 @@ sudo update-ca-trust</pre>
     <details>
       <summary>macOS — Chrome / Safari</summary>
       <ol>
-        <li>Откройте <code>PassManager-CA.pem</code> двойным щелчком, добавьте в связку «Система» или «Вход».</li>
-        <li>В «Связке ключей» откройте сертификат, в разделе «Доверие» выберите «Всегда доверять».</li>
-        <li>Либо из терминала:
-          <pre>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain PassManager-CA.pem</pre>
+        <li>Double-click <code>QuipuChip-CA.pem</code> and add it to the "System" or "Login" keychain.</li>
+        <li>In Keychain Access, open the certificate, go to "Trust", and set "When using this certificate" to "Always Trust".</li>
+        <li>Or from terminal:
+          <pre>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain QuipuChip-CA.pem</pre>
         </li>
       </ol>
     </details>
@@ -237,56 +237,54 @@ sudo update-ca-trust</pre>
     <details>
       <summary>Android</summary>
       <ol>
-        <li>Скачайте <code>PassManager-CA.crt</code> на устройство.</li>
-        <li>Настройки → Безопасность → Шифрование и учётные данные → Установить сертификат → «Сертификат CA».</li>
-        <li>Подтвердите предупреждение и выберите скачанный файл.</li>
+        <li>Download <code>QuipuChip-CA.crt</code> to your device.</li>
+        <li>Settings → Security → Encryption & credentials → Install a certificate → CA certificate.</li>
+        <li>Confirm the warning and select the downloaded file.</li>
       </ol>
     </details>
 
     <details>
       <summary>iOS / iPadOS</summary>
       <ol>
-        <li>Скачайте <code>PassManager-CA.crt</code> и откройте его.</li>
-        <li>Настройки → Основные → VPN и управление устройством → установите профиль.</li>
-        <li>Настройки → Основные → Об этом устройстве → Доверие сертификатам → включите полное доверие.</li>
+        <li>Download <code>QuipuChip-CA.crt</code> and open it.</li>
+        <li>Settings → General → VPN & Device Management → install the profile.</li>
+        <li>Settings → General → About → Certificate Trust Settings → enable full trust.</li>
       </ol>
     </details>
 
     <details>
-      <summary>Сертификат пересоздан (после стирания раздела tls)</summary>
+      <summary>Certificate reissued (after erasing tls partition)</summary>
       <ol>
-        <li>CA хранится на устройстве и меняется только при стирании раздела <code>tls</code>. После этого доверие к
-          прежнему сертификату больше не действует, и браузер снова покажет предупреждение.</li>
-        <li>Сначала сверьте SHA-256 отпечаток выше: если он изменился, старый CA нужно <strong>удалить</strong>, а затем
-          импортировать новый. Импорт с тем же именем «PassManager CA» без удаления старого может не пройти.</li>
-        <li><strong>Linux — Chrome / Chromium (NSS):</strong> удалить старый и внести новый:
-          <pre>certutil -d sql:$HOME/.pki/nssdb -D -n "PassManager CA"
-certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "PassManager CA" -i PassManager-CA.crt</pre>
+        <li>The CA is stored on the device and only changes when the <code>tls</code> partition is erased. After that, the
+          old certificate is no longer trusted and your browser will show a warning again.</li>
+        <li>First check the SHA-256 fingerprint above: if it changed, remove the old CA and import the new one.
+          Importing with the same name "QuipuChip CA" without removing the old one may fail.</li>
+        <li><strong>Linux — Chrome / Chromium (NSS):</strong> remove old and add new:
+          <pre>certutil -d sql:$HOME/.pki/nssdb -D -n "QuipuChip CA"
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "QuipuChip CA" -i QuipuChip-CA.crt</pre>
         </li>
         <li><strong>Linux — системное хранилище (Arch / CachyOS / Manjaro):</strong>
-          <pre>sudo trust anchor --remove PassManager-CA.crt
+          <pre>sudo trust anchor --remove QuipuChip-CA.crt
 sudo update-ca-trust</pre>
-          Если сертификат был положен в <code>/etc/ca-certificates/trust-source/anchors/</code>, вместо этого удалите
-          файл оттуда и выполните <code>sudo update-ca-trust</code>.
+          If the cert was placed in <code>/etc/ca-certificates/trust-source/anchors/</code>, remove the file there
+          and run <code>sudo update-ca-trust</code>.
         </li>
         <li><strong>Linux — системное хранилище (Debian / Ubuntu):</strong>
-          <pre>sudo rm /usr/local/share/ca-certificates/PassManager-CA.crt
+          <pre>sudo rm /usr/local/share/ca-certificates/QuipuChip-CA.crt
 sudo update-ca-certificates</pre>
         </li>
         <li><strong>Linux — системное хранилище (Fedora / RHEL):</strong>
-          <pre>sudo rm /etc/pki/ca-trust/source/anchors/PassManager-CA.pem
+          <pre>sudo rm /etc/pki/ca-trust/source/anchors/QuipuChip-CA.pem
 sudo update-ca-trust</pre>
         </li>
-        <li><strong>Windows:</strong> <code>certutil -delstore -user Root "PassManager CA"</code> для хранилища
-          пользователя или <code>certutil -delstore Root "PassManager CA"</code> от имени администратора.</li>
-        <li><strong>Firefox:</strong> удалить в <code>about:preferences#privacy</code> → «Сертификаты» → «Просмотр
-          сертификатов» → «Центры сертификации» → выбрать <code>PassManager CA</code> → «Удалить», затем импортировать
-          новый.</li>
+        <li><strong>Windows:</strong> <code>certutil -delstore -user Root "QuipuChip CA"</code> for current user
+          or <code>certutil -delstore Root "QuipuChip CA"</code> as administrator.</li>
+        <li><strong>Firefox:</strong> remove in <code>about:preferences#privacy</code> → Certificates → View Certificates
+          → Authorities → select <code>QuipuChip CA</code> → Delete, then import the new one.</li>
       </ol>
     </details>
 
-    <p class="note">После установки откройте <code>https://192.168.7.1/</code> — именно так, сертификат выдан на этот
-      IP-адрес.</p>
+    <p class="note">After installing, open <code>https://192.168.7.1/</code> — the certificate is issued for this IP address.</p>
   </div>
 
   <script>
@@ -300,7 +298,7 @@ sudo update-ca-trust</pre>
         }
       })
       .catch(function () {
-        // Отпечаток необязателен: скачивание сертификата работает и без него.
+        // Fingerprint is optional: downloading the certificate works without it.
       });
   </script>
 </body>

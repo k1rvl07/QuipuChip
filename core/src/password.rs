@@ -126,4 +126,53 @@ mod tests {
         }
         assert_eq!(parts[MASTER_WORDS], "55");
     }
+
+    #[test]
+    fn the_word_index_always_lands_in_the_table() {
+        // The index comes from the top 12 bits of a u32, so it is always in
+        // 0..4096 -- no modulo, no rejection, no bias.
+        for pattern in [
+            [0x00u8, 0x00, 0x00, 0x00],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x00, 0x00, 0xF0, 0x3F],
+            [0x12, 0x34, 0x56, 0x78],
+        ] {
+            let mut s = CycleSource::new(&pattern);
+            for _ in 0..64 {
+                let idx = random_word_index(&mut s);
+                assert!(
+                    idx < crate::wordlist::WORD_COUNT,
+                    "index {idx} out of range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_string_form_is_the_same_password() {
+        let mut s = CycleSource::new(&[0x03, 0x00, 0x10, 0x00, 0x11, 0x22]);
+        let bytes = generate_password(&mut s);
+        let mut s2 = CycleSource::new(&[0x03, 0x00, 0x10, 0x00, 0x11, 0x22]);
+        let text = generate_password_string(&mut s2);
+        assert_eq!(text.len(), MASTER_PASSWORD_CHARS);
+        assert_eq!(text.as_bytes(), &bytes[..]);
+        assert!(text.is_ascii());
+    }
+
+    #[test]
+    fn every_word_is_a_real_dictionary_word() {
+        // The generated password must consist of words that actually exist in
+        // the table, otherwise the dictionary is broken.
+        let mut s = CycleSource::new(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        let pw = generate_password(&mut s);
+        let text = core::str::from_utf8(&pw).unwrap();
+        let parts: Vec<&str> = text.split('-').collect();
+        for w in &parts[..MASTER_WORDS] {
+            assert_eq!(w.len(), MASTER_WORD_BYTES);
+            let found = crate::wordlist::WORDS
+                .windows(MASTER_WORD_BYTES + 1)
+                .any(|c| &c[..MASTER_WORD_BYTES] == w.as_bytes() && c[MASTER_WORD_BYTES] == 0);
+            assert!(found, "{w:?} is not a dictionary word");
+        }
+    }
 }

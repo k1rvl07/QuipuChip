@@ -427,8 +427,8 @@ mod tests {
 
     fn params() -> IssuerParams<'static> {
         IssuerParams {
-            ca_cn: "PassManager CA",
-            leaf_cn: "PassManager",
+            ca_cn: "QuipuChip CA",
+            leaf_cn: "QuipuChip",
             san_ip: [192, 168, 7, 1],
             not_before: 1_577_836_800,
             not_after: 4_102_444_800,

@@ -68,4 +68,40 @@ mod tests {
         assert!(!decode_into(b"zzzz", &mut out));
         assert!(!decode_into(b"00g0", &mut out));
     }
+
+    #[test]
+    fn nibble_accepts_both_cases_and_rejects_the_rest() {
+        for c in b"0123456789" {
+            assert_eq!(nibble(*c), Some(*c - b'0'));
+        }
+        for c in b"abcdef" {
+            assert_eq!(nibble(*c), Some(c - b'a' + 10));
+        }
+        for c in b"ABCDEF" {
+            assert_eq!(nibble(*c), Some(c - b'A' + 10));
+        }
+        for c in [b'g', b'G', b' ', b'-', b'/', b'\'', 0x00, 0xFF] {
+            assert_eq!(nibble(c), None, "byte {c:#04x} must not be a hex digit");
+        }
+    }
+
+    #[test]
+    fn decode_into_requires_an_exact_length() {
+        let mut out = [0u8; 3];
+        // Six hex characters are exactly three bytes.
+        assert!(!decode_into(b"001122", &mut [0u8; 4]));
+        assert!(!decode_into(b"00112233", &mut out));
+        assert!(decode_into(b"001122", &mut out));
+        assert_eq!(out, [0x00, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn encode_is_lowercase_and_two_chars_per_byte() {
+        assert_eq!(encode(&[]), "");
+        assert_eq!(encode(&[0x00, 0x0f, 0xa0, 0xff]).len(), 8);
+        assert_eq!(encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        // Lowercase only: an uppercase encoder would break the session-token
+        // comparison in the firmware.
+        assert!(encode(&[0xAB]).chars().all(|c| !c.is_ascii_uppercase()));
+    }
 }

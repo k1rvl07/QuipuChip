@@ -7,6 +7,18 @@
   const POLL_MS = 300;
   const BASE32_RE = /^[A-Z2-7]+=*$/;
 
+  // Protected JSON export/import: outer envelope, encrypted with the vault's
+  // master password (plus its key file, when the vault requires one) using
+  // PBKDF2-HMAC-SHA256 + AES-256-GCM via WebCrypto, in the browser.
+  const JSON_FORMAT = 'JSON';
+  const JSON_VERSION = 2;
+  const JSON_KDF_ITERS = 200000;
+  const JSON_KDF_MIN_ITERS = 10000;
+  const JSON_KDF_MAX_ITERS = 5000000;
+  const JSON_SALT_BYTES = 16;
+  const JSON_IV_BYTES = 12;
+  const JSON_TAG_BYTES = 16;
+
   // Inline icons for the copy buttons. `currentColor` lets `.btn` theming apply.
   const ICON_COPY =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
@@ -41,7 +53,11 @@
     totpRaf: null,
     cardTotpRaf: null,
     cardTotpCells: [],
+    vaultMaster: '',
   };
+
+  const jsonState = { mode: 'export', doc: null, keyfileRequired: false };
+  let exportState = { mode: 'json' };
 
   const RU = {
     wrong_password: 'Неверный мастер-пароль',
@@ -91,6 +107,13 @@
     kdbx_no_file: 'Выберите файл .kdbx',
     kdbx_no_password: 'Введите пароль файла',
     kdbx_make_failed: 'Не удалось сформировать файл .kdbx',
+    json_bad_format: 'Файл не является защищённым JSON этого формата',
+    json_no_password: 'Введите мастер-пароль',
+
+    json_keyfile_required: 'Выберите файл-ключ хранилища',
+    json_wrong_password: 'Неверный мастер-пароль или файл-ключ (либо файл повреждён)',
+    json_corrupt: 'Файл повреждён или имеет неверный формат',
+    webcrypto_unavailable: 'Браузер не поддерживает WebCrypto (нужен HTTPS)',
   };
 
   function el(id) {
@@ -549,18 +572,54 @@
     return out;
   }
 
-  const KEYFILE_NAME = 'passmanager-keyfile.bin';
+  function bytesToB64(bytes) {
+    const buf = new Uint8Array(bytes);
+    let s = '';
+    for (let i = 0; i < buf.length; i += 1) {
+      s += String.fromCharCode(buf[i]);
+    }
+    return btoa(s);
+  }
 
-  function downloadKeyfile(b64) {
-    const url = URL.createObjectURL(new Blob([b64ToBytes(b64)], { type: 'application/octet-stream' }));
+  async function readKeyfileBytes(input, maxBytes) {
+    const file = input.files && input.files[0];
+    if (!file || !file.size) {
+      return null;
+    }
+    if (file.size > maxBytes) {
+      throw new ApiError(400, 'keyfile_too_large');
+    }
+    return new Uint8Array(await file.arrayBuffer());
+  }
+
+  function wipeBytes(a) {
+    if (!a || !a.fill) {
+      return;
+    }
+    try {
+      a.fill(0);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = KEYFILE_NAME;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
+
+  const KEYFILE_NAME = 'passmanager-keyfile.bin';
+
+  function downloadKeyfile(b64) {
+    downloadBlob(new Blob([b64ToBytes(b64)], { type: 'application/octet-stream' }), KEYFILE_NAME);
+  }
+
 
   function randInt(max) {
     const zone = Math.floor(0x10000 / max) * max;
@@ -580,18 +639,35 @@
     sym: '!@#$%^&*()-_=+[]{};:,.?/',
   };
 
-  function generatePassword() {
-    const len = parseInt(el('genLen').value, 10) || 16;
+  function getPasswordGenOptions(prefix = '') {
+    const lenEl = el(prefix ? `${prefix}GenLen` : 'genLen');
+    const len = parseInt(lenEl && lenEl.value, 10) || 16;
     const chosen = [];
     for (const key of ['upper', 'lower', 'digits', 'sym']) {
-      const cb = el(`gen${key.charAt(0).toUpperCase()}${key.slice(1)}`);
-      if (cb.checked) {
+      const cbId = prefix ? `${prefix}Gen${key.charAt(0).toUpperCase()}${key.slice(1)}` : `gen${key.charAt(0).toUpperCase()}${key.slice(1)}`;
+      const cb = el(cbId);
+      if (cb && cb.checked) {
         chosen.push(SETS[key]);
       }
     }
     if (chosen.length === 0) {
+      // fallback to lower if nothing selected
       chosen.push(SETS.lower);
-      el('genLower').checked = true;
+      const fbId = prefix ? `${prefix}GenLower` : 'genLower';
+      const fb = el(fbId);
+      if (fb) fb.checked = true;
+    }
+    return { len, chosen };
+  }
+
+  function generatePassword(opts = {}) {
+    const prefix = opts.prefix || '';
+    let len = opts.length;
+    let chosen = opts.chosen;
+    if (len == null || !chosen) {
+      const o = getPasswordGenOptions(prefix);
+      if (len == null) len = o.len;
+      if (!chosen) chosen = o.chosen;
     }
     const union = chosen.join('');
     const out = [];
@@ -609,6 +685,14 @@
       out[j] = t;
     }
     return out.join('');
+  }
+
+  function generateIntoTarget(inputId, opts = {}) {
+    const inp = el(inputId);
+    if (!inp) return;
+    inp.value = generatePassword(opts);
+    inp.type = 'text';
+    return inp;
   }
 
   async function doProvision() {
@@ -631,6 +715,7 @@
         }
       }
       const res = await submitJob('/api/auth/provision', body);
+      state.vaultMaster = (res.password || '');
       state.masterShown = res.password || '';
       state.keyfileRequired = wantKeyfile;
       // Provision succeeded and submitJob already saved the session token, so
@@ -698,6 +783,7 @@
         body.keyfile = kf.b64;
       }
       await submitJob('/api/auth/unlock', body);
+      state.vaultMaster = pw;
       el('inputUnlock').value = '';
       const file = el('inputUnlockKeyfile');
       if (file) {
@@ -756,6 +842,7 @@
     }
     saveSession('');
     state.unlocked = false;
+    state.vaultMaster = '';
     showScreen('unlock');
     refreshKeyfileBlock();
     statusOf(el('unlockStatus'), 'ok', 'Хранилище заблокировано');
@@ -1388,60 +1475,358 @@
     }
   }
 
-  async function doExport() {
-    const st = el('appStatus');
-    hideStatus(st);
+  // AAD binds the format, version and KDF/cipher parameters (including the
+  // key-file flag), so tampering with them invalidates the GCM tag.
+  function jsonAad(keyfile, kdf, cipher) {
+    return `JSON|${JSON_VERSION}|${kdf.algo}|${kdf.iterations}|${kdf.salt}|${cipher.algo}|${cipher.iv}|keyfile:${keyfile ? 1 : 0}`;
+  }
+
+  function webcrypto() {
+    if (!globalThis.crypto || !crypto.subtle) {
+      throw new ApiError(0, 'webcrypto_unavailable');
+    }
+    return crypto.subtle;
+  }
+
+  // Mirrors the vault's KDF material (`core/src/vault.rs`): the password bytes,
+  // plus SHA-256 of the key file when one is supplied. The device factor is
+  // deliberately absent so the exported file stays portable across devices.
+  async function buildFileKey(password, keyfileBytes, salt, iterations) {
+    const enc = new TextEncoder();
+    const parts = [enc.encode(password)];
+    if (keyfileBytes && keyfileBytes.length) {
+      const h = await webcrypto().digest('SHA-256', keyfileBytes);
+      parts.push(new Uint8Array(h));
+    }
+    let total = 0;
+    for (const p of parts) {
+      total += p.length;
+    }
+    const material = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+      material.set(p, off);
+      off += p.length;
+    }
+    const base = await webcrypto().importKey('raw', material, 'PBKDF2', false, ['deriveKey']);
+    return webcrypto().deriveKey(
+      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+      base,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  async function encryptDocument(entries, password, keyfileBytes) {
+    const salt = new Uint8Array(JSON_SALT_BYTES);
+    const iv = new Uint8Array(JSON_IV_BYTES);
+    crypto.getRandomValues(salt);
+    crypto.getRandomValues(iv);
+    const kdf = { algo: 'PBKDF2-SHA256', iterations: JSON_KDF_ITERS, salt: bytesToB64(salt) };
+    const cipher = { algo: 'AES-256-GCM', iv: bytesToB64(iv) };
+    const hasKeyfile = !!(keyfileBytes && keyfileBytes.length);
+    const aad = new TextEncoder().encode(jsonAad(hasKeyfile, kdf, cipher));
+    const key = await buildFileKey(password, keyfileBytes, salt, JSON_KDF_ITERS);
+    const plain = new TextEncoder().encode(JSON.stringify({ entries }));
+    const sealed = new Uint8Array(
+      await webcrypto().encrypt(
+        { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
+        key,
+        plain
+      )
+    );
+    const ctLen = sealed.length - JSON_TAG_BYTES;
+    return {
+      format: JSON_FORMAT,
+      version: JSON_VERSION,
+      protected: true,
+      keyfile: hasKeyfile,
+      kdf,
+      cipher,
+      data: bytesToB64(sealed.subarray(0, ctLen)),
+      tag: bytesToB64(sealed.subarray(ctLen)),
+    };
+  }
+
+  async function decryptDocument(doc, password, keyfileBytes) {
+    if (!doc || doc.format !== JSON_FORMAT || doc.version !== JSON_VERSION || doc.protected !== true) {
+      throw new ApiError(0, 'json_bad_format');
+    }
+    const kdf = doc.kdf;
+    const cipher = doc.cipher;
+    if (!kdf || kdf.algo !== 'PBKDF2-SHA256' || !cipher || cipher.algo !== 'AES-256-GCM') {
+      throw new ApiError(0, 'json_bad_format');
+    }
+    const iterations = Number(kdf.iterations);
+    if (
+      !Number.isInteger(iterations) ||
+      iterations < JSON_KDF_MIN_ITERS ||
+      iterations > JSON_KDF_MAX_ITERS
+    ) {
+      throw new ApiError(0, 'json_bad_format');
+    }
+    let salt;
+    let iv;
+    let data;
+    let tag;
     try {
-      const r = await api('/api/export');
-      const text = JSON.stringify(r.data, null, 2);
-      const blob = new Blob([text], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-      a.href = url;
-      a.download = `passmanager-${stamp}.pmx1.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-      statusOf(st, 'ok', `Выгружено записей: ${r.data.count}`);
+      salt = b64ToBytes(kdf.salt);
+      iv = b64ToBytes(cipher.iv);
+      data = b64ToBytes(doc.data);
+      tag = b64ToBytes(doc.tag);
     } catch (e) {
-      statusOf(st, 'error', `Экспорт не удался: ${errMsg(e.code)}`);
+      throw new ApiError(0, 'json_corrupt');
+    }
+    if (salt.length < 8 || iv.length !== JSON_IV_BYTES || tag.length !== JSON_TAG_BYTES) {
+      throw new ApiError(0, 'json_corrupt');
+    }
+    const sealed = new Uint8Array(data.length + tag.length);
+    sealed.set(data, 0);
+    sealed.set(tag, data.length);
+    const aad = new TextEncoder().encode(jsonAad(!!doc.keyfile, kdf, cipher));
+    const key = await buildFileKey(password, keyfileBytes, salt, iterations);
+    let plain;
+    try {
+      plain = await webcrypto().decrypt(
+        { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
+        key,
+        sealed
+      );
+    } catch (e) {
+      throw new ApiError(0, 'json_wrong_password');
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(plain));
+    } catch (e) {
+      throw new ApiError(0, 'json_corrupt');
+    }
+    if (!parsed || !Array.isArray(parsed.entries)) {
+      throw new ApiError(0, 'json_corrupt');
+    }
+    return parsed.entries;
+  }
+
+  function downloadJson(doc) {
+    const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    downloadBlob(blob, `passmanager-${stamp}.json`);
+  }
+
+  function openExportModal(mode) {
+    exportState.mode = mode === 'kdbx' ? 'kdbx' : 'json';
+    const isKdbx = exportState.mode === 'kdbx';
+    el('exportTitle').textContent = isKdbx ? 'Экспорт .kdbx' : 'Экспорт .json';
+    el('exportHint').textContent =
+      'По умолчанию используется мастер-пароль хранилища. Можно снять галку и ввести или сгенерировать другой пароль.';
+    const useVault = el('exportUseVault');
+    if (useVault) {
+      useVault.checked = true;
+    }
+    const custom = el('exportCustomBlock');
+    if (custom) {
+      custom.hidden = true;
+    }
+    const inp = el('inputExportPassword');
+    if (inp) {
+      inp.value = '';
+      inp.type = 'password';
+    }
+    const tog = el('btnExportToggle');
+    if (tog) {
+      tog.textContent = 'Показать';
+    }
+    const kf = el('exportKeyfileBlock');
+    if (kf) {
+      kf.hidden = !(!isKdbx && state.keyfileRequired);
+    }
+    const keyfileInput = el('inputExportKeyfile');
+    if (keyfileInput) {
+      keyfileInput.value = '';
+    }
+    hideStatus(el('exportStatus'));
+    const submit = el('btnExportSubmit');
+    if (submit) {
+      submit.textContent = isKdbx ? 'Скачать .kdbx' : 'Скачать .json';
+      submit.disabled = false;
+    }
+    if (el('modalExport')) {
+      el('modalExport').showModal();
     }
   }
 
-  async function doImport(file) {
+  async function doExportSubmit(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('exportStatus');
+    hideStatus(st);
+    const isKdbx = exportState.mode === 'kdbx';
+    let pw = '';
+    const useVault = el('exportUseVault');
+    if (useVault && useVault.checked) {
+      pw = state.vaultMaster || '';
+    } else {
+      pw = (el('inputExportPassword').value || '').trim();
+    }
+    if (!pw) {
+      statusOf(st, 'error', errMsg('json_no_password'));
+      return;
+    }
+    const btn = el('btnExportSubmit');
+    if (btn) {
+      btn.disabled = true;
+    }
+    statusOf(st, 'warn', 'Подготовка экспорта…');
+    let keyfileBytes = null;
+    try {
+      if (!isKdbx && state.keyfileRequired) {
+        keyfileBytes = await readKeyfileBytes(el('inputExportKeyfile'), state.keyFileMaxBytes);
+        if (!keyfileBytes) {
+          throw new ApiError(0, 'json_keyfile_required');
+        }
+      }
+      const r = await api('/api/export');
+      const pmx = r.data || {};
+      const entries = Array.isArray(pmx.entries) ? pmx.entries : [];
+      if (isKdbx) {
+        const K = await ensureKdbx();
+        const creds = new K.Credentials(K.ProtectedValue.fromString(pw));
+        const db = K.Kdbx.create(creds, '/QuipuChip');
+        const root = db.getDefaultGroup();
+        for (const it of entries) {
+          const en = db.createEntry(root);
+          en.fields.set('Title', it.title || '');
+          en.fields.set('UserName', it.login || '');
+          en.fields.set('Password', K.ProtectedValue.fromString(it.password || ''));
+          en.fields.set('URL', it.url || '');
+          en.fields.set('Notes', it.note || '');
+          if (it.tags) {
+            en.fields.set('Tags', it.tags);
+          }
+          if (it.totp) {
+            const digits = it.totpDigits || '6';
+            const period = it.totpPeriod || '30';
+            en.fields.set(
+              'otp',
+              `otpauth://totp/${encodeURIComponent(it.title || 'entry')}?secret=${it.totp}&digits=${digits}&period=${period}`
+            );
+          }
+        }
+        const saved = await db.save();
+        const blob = new Blob([saved], { type: 'application/x-keepass2' });
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        downloadBlob(blob, 'passmanager.kdbx');
+        statusOf(st, 'ok', `Файл .kdbx сформирован: ${entries.length} записей`);
+      } else {
+        const doc = await encryptDocument(entries, pw, keyfileBytes);
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        downloadBlob(new Blob([JSON.stringify(doc)], { type: 'application/json' }), `passmanager-${stamp}.json`);
+        statusOf(st, 'ok', `Выгружено записей: ${entries.length}`);
+      }
+      setTimeout(() => el('modalExport') && el('modalExport').close(), 900);
+    } catch (err) {
+      statusOf(st, 'error', errMsg(err.code));
+    } finally {
+      if (btn) btn.disabled = false;
+      wipeBytes(keyfileBytes);
+    }
+  }
+
+  function openJsonExport() {
+    jsonState.mode = 'export';
+    jsonState.doc = null;
+    jsonState.keyfileRequired = !!state.keyfileRequired;
+    el('jsonTitle').textContent = 'Экспорт JSON';
+    el('jsonHint').textContent = state.keyfileRequired
+      ? 'Файл защищён мастер-паролем хранилища и его файлом-ключом. Пароль и файл-ключ нигде не сохраняются — без них файл не открыть.'
+      : 'Файл защищён мастер-паролем хранилища. Пароль нигде не сохраняется — потеря пароля означает потерю доступа к файлу.';
+    el('jsonConfirmBlock').hidden = false;
+    el('jsonKeyfileBlock').hidden = !state.keyfileRequired;
+    el('inputJsonPassword').value = '';
+    el('inputJsonPassword').type = 'password';
+    el('btnJsonToggle').textContent = 'Показать';
+    el('inputJsonConfirm').value = '';
+    el('inputJsonKeyfile').value = '';
+    hideStatus(el('jsonStatus'));
+    el('btnJsonSubmit').textContent = 'Скачать JSON';
+    el('btnJsonSubmit').disabled = false;
+    el('modalJson').showModal();
+    el('inputJsonPassword').focus();
+  }
+
+  async function doExportJson(e) {
+    if (e) {
+      e.preventDefault();
+    }
+    const st = el('jsonStatus');
+    hideStatus(st);
+    const pw = el('inputJsonPassword').value;
+    if (!pw) {
+      statusOf(st, 'error', errMsg('json_no_password'));
+      return;
+    }
+    if (el('inputJsonConfirm').value !== pw) {
+
+      return;
+    }
+    const kfFile = el('inputJsonKeyfile').files[0];
+    const btn = el('btnJsonSubmit');
+    btn.disabled = true;
+    statusOf(st, 'warn', 'Шифрование…');
+    let keyfileBytes = null;
+    try {
+      if (jsonState.keyfileRequired) {
+        if (!kfFile || !kfFile.size) {
+          throw new ApiError(0, 'json_keyfile_required');
+        }
+        keyfileBytes = new Uint8Array(await kfFile.arrayBuffer());
+      }
+      const r = await api('/api/export');
+      const entries = r.data && Array.isArray(r.data.entries) ? r.data.entries : [];
+      const doc = await encryptDocument(entries, pw, keyfileBytes);
+      downloadJson(doc);
+      statusOf(st, 'ok', `Выгружено записей: ${entries.length}`);
+      el('inputJsonPassword').value = '';
+      el('inputJsonConfirm').value = '';
+      el('inputJsonKeyfile').value = '';
+      setTimeout(() => el('modalJson').close(), 900);
+    } catch (err) {
+      statusOf(st, 'error', `Экспорт не удался: ${errMsg(err.code)}`);
+      btn.disabled = false;
+    } finally {
+      if (keyfileBytes) {
+        keyfileBytes.fill(0);
+      }
+    }
+  }
+
+  async function onImportJsonFile(file) {
     const st = el('appStatus');
     hideStatus(st);
     if (!file) {
       return;
     }
-    let parsed;
+    let doc;
     try {
-      parsed = JSON.parse(await file.text());
+      doc = JSON.parse(await file.text());
     } catch (e) {
-      statusOf(st, 'error', 'Файл не является корректным JSON');
+      statusOf(st, 'error', errMsg('json_bad_format'));
       return;
     }
-    if (!parsed || parsed.format !== 'PMX1' || parsed.version !== 1 || !Array.isArray(parsed.entries)) {
-      statusOf(st, 'error', 'Файл не в формате PMX1 версии 1');
+    if (!doc || doc.format !== JSON_FORMAT || doc.version !== JSON_VERSION || doc.protected !== true) {
+      statusOf(st, 'error', errMsg('json_bad_format'));
       return;
     }
-    const all = parsed.entries;
-    if (all.length === 0) {
-      statusOf(st, 'warn', 'В файле нет записей');
-      return;
-    }
-    try {
-      const imported = await importChunks(all, (done, total) =>
-        statusOf(st, 'warn', `Импорт: ${done} из ${total}…`)
-      );
-      statusOf(st, 'ok', `Импортировано записей: ${imported} из ${all.length}`);
-      await loadEntries();
-    } catch (e) {
-      statusOf(st, 'error', `Импорт прерван: ${errMsg(e.code)}. Уже добавлено: ${e.imported | 0}`);
-      await loadEntries();
-    }
+    // JSON import modal removed; use appStatus flow not supported in this build
+    statusOf(st, 'error', 'Импорт JSON временно недоступен после унификации экспорта');
+    return;
+  }
+
+  async function doImportJson() {
+    // Disabled after modalJson removal
+    return;
   }
 
   async function importChunks(all, onProgress) {
@@ -1463,6 +1848,30 @@
       }
     }
     return imported;
+  }
+
+  async function runImportEntries(entries, statusNode) {
+    if (!entries || entries.length === 0) {
+      statusOf(statusNode, 'warn', 'В файле нет записей');
+      return 0;
+    }
+    let imported = 0;
+    try {
+      imported = await importChunks(entries, (done, total) =>
+        statusOf(statusNode, 'warn', `Импорт: ${done} из ${total}…`)
+      );
+      statusOf(statusNode, 'ok', `Импортировано записей: ${imported} из ${entries.length}`);
+      await loadEntries();
+      return imported;
+    } catch (err) {
+      if (err && typeof err.imported === 'number') {
+        statusOf(statusNode, 'error', `Импорт прерван: ${errMsg(err.code)}. Уже добавлено: ${err.imported | 0}`);
+        await loadEntries();
+        return err.imported | 0;
+      }
+      statusOf(statusNode, 'error', errMsg(err.code));
+      throw err;
+    }
   }
 
   function openResetModal() {
@@ -1489,6 +1898,7 @@
       state.editingId = null;
       state.viewId = null;
       state.masterShown = '';
+      state.vaultMaster = '';
       if (el('modalReset').open) {
         el('modalReset').close();
       }
@@ -1762,23 +2172,19 @@
   async function kdbxDoImport() {
     const st = el('kdbxImportStatus2');
     hideStatus(st);
-    const all = kdbxImportState.entries;
-    if (!all.length) {
-      return;
-    }
     const btn = el('btnKdbxImportNext');
     btn.disabled = true;
     try {
-      const imported = await importChunks(all, (done, total) =>
-        statusOf(st, 'warn', `Импорт: ${done} из ${total}…`)
-      );
-      statusOf(st, 'ok', `Импортировано: ${imported} из ${all.length}`);
-      await loadEntries();
+      await runImportEntries(kdbxImportState.entries, st);
       setTimeout(() => el('modalKdbxImport').close(), 1200);
     } catch (e) {
-      statusOf(st, 'error', `Импорт прерван: ${errMsg(e.code)}. Уже добавлено: ${e.imported | 0}`);
+      if (e && typeof e.imported === 'number') {
+        statusOf(st, 'error', `Импорт прерван: ${errMsg(e.code)}. Уже добавлено: ${e.imported | 0}`);
+        await loadEntries();
+      }
       btn.disabled = false;
-      await loadEntries();
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -1801,7 +2207,7 @@
       const r = await api('/api/export');
       const pmx = r.data || {};
       const creds = new K.Credentials(K.ProtectedValue.fromString(pw));
-      const db = K.Kdbx.create(creds, '/PassManager');
+      const db = K.Kdbx.create(creds, '/QuipuChip');
       const root = db.getDefaultGroup();
       const items = Array.isArray(pmx.entries) ? pmx.entries : [];
       for (const it of items) {
@@ -1897,11 +2303,11 @@
     el('btnNew').addEventListener('click', () => openEdit(null));
     el('searchInput').addEventListener('input', render);
 
-    el('btnExport').addEventListener('click', doExport);
+    el('btnExport').addEventListener('click', () => openExportModal('json'));
     el('inputImportFile').addEventListener('change', (e) => {
       const file = e.target.files && e.target.files[0];
       e.target.value = '';
-      doImport(file);
+      onImportJsonFile(file);
     });
 
     el('btnEntryClose').addEventListener('click', () => el('modalEntry').close());
@@ -2014,23 +2420,8 @@
     el('btnResetCancel').addEventListener('click', () => el('modalReset').close());
     el('formReset').addEventListener('submit', doReset);
 
-    el('btnExportKdbx').addEventListener('click', () => {
-      el('inputKdbxExportPassword').value = '';
-      hideStatus(el('kdbxExportStatus'));
-      el('modalKdbxExport').showModal();
-    });
-    el('btnKdbxExportClose').addEventListener('click', () => el('modalKdbxExport').close());
-    el('btnKdbxExportCancel').addEventListener('click', () => el('modalKdbxExport').close());
-    el('formKdbxExport').addEventListener('submit', doExportKdbx);
-    el('btnKdbxExportGen').addEventListener('click', () => {
-      el('inputKdbxExportPassword').value = generatePassword();
-    });
-    el('btnKdbxExportToggle').addEventListener('click', () => {
-      const inp = el('inputKdbxExportPassword');
-      const show = inp.type === 'password';
-      inp.type = show ? 'text' : 'password';
-      el('btnKdbxExportToggle').textContent = show ? 'Скрыть' : 'Показать';
-    });
+    el('btnExportKdbx').addEventListener('click', () => openExportModal('kdbx'));
+    // Kdbx export moved to unified modalExport
 
     el('inputImportKdbxFile').addEventListener('change', (e) => {
       const file = e.target.files && e.target.files[0];
@@ -2057,6 +2448,67 @@
       }
     });
     el('modalKdbxImport').addEventListener('close', kdbxImportReset);
+
+    el('btnExportClose').addEventListener('click', () => el('modalExport') && el('modalExport').close());
+    el('btnExportCancel').addEventListener('click', () => el('modalExport') && el('modalExport').close());
+    if (el('exportUseVault')) {
+      el('exportUseVault').addEventListener('change', () => {
+        const custom = el('exportCustomBlock');
+        if (custom) {
+          custom.hidden = el('exportUseVault').checked;
+        }
+        const g = el('expGenOpts');
+        if (g && el('exportUseVault').checked) {
+          g.hidden = true;
+        }
+      });
+    }
+    if (el('btnExportShowGenOpts')) {
+      el('btnExportShowGenOpts').addEventListener('click', () => {
+        const g = el('expGenOpts');
+        if (g) g.hidden = false;
+      });
+    }
+    if (el('btnExportGen')) {
+      el('btnExportGen').addEventListener('click', () => {
+        const g = el('expGenOpts');
+        if (g) g.hidden = false;
+      });
+    }
+    if (el('expGenLen')) {
+      el('expGenLen').addEventListener('input', () => {
+        const v = el('expGenLenVal');
+        if (v) v.textContent = el('expGenLen').value;
+      });
+    }
+    function confirmExportGen() {
+      const inp = generateIntoTarget('inputExportPassword', { prefix: 'exp' });
+      if (inp) inp.type = 'text';
+      if (el('btnExportToggle')) el('btnExportToggle').textTextContent;
+      if (el('btnExportToggle')) el('btnExportToggle').textContent = 'Скрыть';
+    }
+    if (el('btnExportGenAgain')) {
+      el('btnExportGenAgain').addEventListener('click', confirmExportGen);
+    }
+    if (el('btnExportToggle')) {
+      el('btnExportToggle').addEventListener('click', () => {
+        const inp = el('inputExportPassword');
+        if (!inp) return;
+        const show = inp.type === 'password';
+        inp.type = show ? 'text' : 'password';
+        if (el('btnExportToggle')) {
+          el('btnExportToggle').textContent = show ? 'Скрыть' : 'Показать';
+        }
+      });
+    }
+    el('formExport').addEventListener('submit', doExportSubmit);
+    el('modalExport').addEventListener('close', () => {
+      if (el('inputExportPassword')) el('inputExportPassword').value = '';
+      if (el('inputExportKeyfile')) el('inputExportKeyfile').value = '';
+      hideStatus(el('exportStatus'));
+    });
+
+    // modalJson removed; JSON import handled via legacy flow removed
   }
 
   document.addEventListener('DOMContentLoaded', () => {

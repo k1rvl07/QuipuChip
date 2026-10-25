@@ -135,3 +135,130 @@ impl Default for Snapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+
+    /// Every variant, in declaration order. The numeric discriminants are a
+    /// logging contract with the C++ reference, so they are pinned here.
+    const ALL_ERRORS: [VaultError; 12] = [
+        VaultError::None,
+        VaultError::NotFound,
+        VaultError::BootStrap,
+        VaultError::WrongPassword,
+        VaultError::Tampered,
+        VaultError::Budget,
+        VaultError::NoSpace,
+        VaultError::Serial,
+        VaultError::Crypto,
+        VaultError::Io,
+        VaultError::TooManyEntries,
+        VaultError::EntryTooLong,
+    ];
+
+    #[test]
+    fn error_discriminants_are_stable() {
+        // The firmware logs `state as u32`; a reordering would silently change
+        // what an operator sees in the log.
+        let expected = [
+            (VaultError::None, 0u8),
+            (VaultError::NotFound, 1),
+            (VaultError::BootStrap, 2),
+            (VaultError::WrongPassword, 3),
+            (VaultError::Tampered, 4),
+            (VaultError::Budget, 5),
+            (VaultError::NoSpace, 6),
+            (VaultError::Serial, 7),
+            (VaultError::Crypto, 8),
+            (VaultError::Io, 9),
+            (VaultError::TooManyEntries, 10),
+            (VaultError::EntryTooLong, 11),
+        ];
+        for (err, code) in expected {
+            assert_eq!(err as u8, code, "discriminant of {err:?}");
+        }
+    }
+
+    #[test]
+    fn error_strings_match_the_reference_wording() {
+        // These strings are the wire wording the C++ reference used. They are
+        // part of the contract, not decoration.
+        let expected = [
+            (VaultError::None, "ok"),
+            (VaultError::NotFound, "partition not found"),
+            (VaultError::BootStrap, "not provisioned yet"),
+            (VaultError::WrongPassword, "wrong password"),
+            (VaultError::Tampered, "tampered"),
+            (VaultError::Budget, "live byte budget exceeded"),
+            (VaultError::NoSpace, "no space in vault"),
+            (VaultError::Serial, "serialization failed"),
+            (VaultError::Crypto, "crypto failed"),
+            (VaultError::Io, "flash io failed"),
+            (VaultError::TooManyEntries, "entry count limit"),
+            (VaultError::EntryTooLong, "entry too long"),
+        ];
+        for (err, text) in expected {
+            assert_eq!(err.as_str(), text, "as_str of {err:?}");
+            assert_eq!(err.to_string(), text, "Display of {err:?}");
+        }
+    }
+
+    #[test]
+    fn every_error_variant_has_a_distinct_string() {
+        let mut seen: Vec<&str> = Vec::new();
+        for err in ALL_ERRORS {
+            let text = err.as_str();
+            assert!(!text.is_empty(), "{err:?} has an empty string");
+            assert!(!seen.contains(&text), "duplicate error text: {text}");
+            seen.push(text);
+        }
+        assert_eq!(seen.len(), ALL_ERRORS.len());
+    }
+
+    #[test]
+    fn errors_implement_the_error_trait() {
+        fn as_dyn(err: &dyn core::error::Error) -> String {
+            err.to_string()
+        }
+        for err in ALL_ERRORS {
+            assert_eq!(as_dyn(&err), err.as_str());
+        }
+    }
+
+    #[test]
+    fn state_discriminants_and_strings() {
+        assert_eq!(State::Unprovisioned as u8, 0);
+        assert_eq!(State::Locked as u8, 1);
+        assert_eq!(State::Unlocked as u8, 2);
+
+        assert_eq!(State::Unprovisioned.as_str(), "unprovisioned");
+        assert_eq!(State::Locked.as_str(), "locked");
+        assert_eq!(State::Unlocked.as_str(), "unlocked");
+
+        assert_eq!(State::Unprovisioned.to_string(), "unprovisioned");
+        assert_eq!(State::Locked.to_string(), "locked");
+        assert_eq!(State::Unlocked.to_string(), "unlocked");
+    }
+
+    #[test]
+    fn stats_default_is_empty() {
+        let s = Stats::default();
+        assert_eq!(s.entry_count, 0);
+        assert_eq!(s.live_bytes, 0);
+        assert_eq!(s.used_bytes, 0);
+        assert_eq!(s.generation, 0);
+        assert!(!s.compacted_once);
+    }
+
+    #[test]
+    fn snapshot_default_is_unprovisioned() {
+        let s = Snapshot::default();
+        assert_eq!(s.state, State::Unprovisioned);
+        assert_eq!(s.entry_count, 0);
+        assert_eq!(s.generation, 0);
+        assert_eq!(s.live_bytes, 0);
+    }
+}

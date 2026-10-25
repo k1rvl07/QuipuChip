@@ -401,7 +401,7 @@ impl<R: RandomSource, C: Clock> Auth<R, C> {
         }
         // A Keep with no new password would only re-encrypt under the same
         // material; refuse it so a caller cannot submit an empty change.
-        if matches!(action, KeyfileAction::Keep) && new_password.map_or(true, str::is_empty) {
+        if matches!(action, KeyfileAction::Keep) && new_password.is_none_or(str::is_empty) {
             return (NO_JOB, None);
         }
 
@@ -1365,5 +1365,225 @@ mod tests {
         let pw = a.generate_master_password();
         assert_eq!(pw.len(), MASTER_PASSWORD_CHARS);
         assert_eq!(pw.split('-').count(), 6 + 1);
+    }
+
+    // ── Uncovered branches ───────────────────────────────────────────────────
+
+    /// The submit path refuses out-of-range input before any KDF work, so a
+    /// hostile client cannot make the device burn seconds per request.
+    #[test]
+    fn submit_validates_its_input_before_queuing() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        provision(&mut a, &mut v);
+
+        // Empty and over-long passwords.
+        assert_eq!(a.submit_unlock("", &[]).0, NO_JOB);
+        let long = "x".repeat(MAX_PASS_CHARS);
+        assert_eq!(a.submit_unlock(&long, &[]).0, NO_JOB);
+        // Over-long key file.
+        let big_kf = vec![0u8; KEYFILE_MAX_BYTES + 1];
+        assert_eq!(a.submit_unlock(PW, &big_kf).0, NO_JOB);
+        // Rekey: empty old password, over-long old password, over-long new
+        // password, over-long key file.
+        assert_eq!(
+            a.submit_rekey("", Some(PW2), &[], &[], KeyfileAction::Keep)
+                .0,
+            NO_JOB
+        );
+        assert_eq!(
+            a.submit_rekey(&long, Some(PW2), &[], &[], KeyfileAction::Keep)
+                .0,
+            NO_JOB
+        );
+        assert_eq!(
+            a.submit_rekey(PW, Some(&long), &[], &[], KeyfileAction::Keep)
+                .0,
+            NO_JOB
+        );
+        assert_eq!(
+            a.submit_rekey(PW, Some(PW2), &big_kf, &[], KeyfileAction::Keep)
+                .0,
+            NO_JOB
+        );
+        assert_eq!(
+            a.submit_rekey(PW, Some(PW2), &[], &big_kf, KeyfileAction::Set)
+                .0,
+            NO_JOB
+        );
+        // Provision with an over-long key file.
+        assert_eq!(a.submit_provision(&big_kf, false).0, NO_JOB);
+    }
+
+    /// Only one job may be in flight. A second submit is refused, and the
+    /// first job's secrets are not wiped by the refusal.
+    #[test]
+    fn a_second_submit_is_refused_while_a_job_is_in_flight() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let (id, req) = a.submit_provision(&[], false);
+        assert_ne!(id, NO_JOB);
+        assert!(a.state().busy);
+        // The vault is still unprovisioned, so an unlock would be refused for a
+        // different reason; use a reset, which is always accepted.
+        assert_eq!(a.submit_reset().0, NO_JOB);
+        assert_eq!(
+            a.submit_rekey(PW, Some(PW2), &[], &[], KeyfileAction::Keep)
+                .0,
+            NO_JOB
+        );
+
+        // The first job still completes and hands out its password.
+        a.run(&mut v, req.as_ref().unwrap());
+        let view = a.poll(id).unwrap();
+        assert_eq!(view.result, JobResult::Ok);
+        assert!(!view.password.is_empty());
+        assert!(!a.state().busy);
+    }
+
+    #[test]
+    fn polling_an_unknown_job_id_returns_nothing() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let (id, req) = a.submit_provision(&[], false);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert!(a.poll(id).is_some());
+        assert!(a.poll(id.wrapping_add(1)).is_none());
+        assert!(a.poll(NO_JOB).is_none());
+        assert!(a.poll(0).is_none());
+    }
+
+    /// A flash fault is not the user's fault: it must not count towards the
+    /// lockout, or a failing device would lock its owner out.
+    #[test]
+    fn a_storage_fault_is_an_error_and_not_a_failed_attempt() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let pw = provision(&mut a, &mut v);
+        // A second header slot exists only after a write; make it unreadable
+        // so that `begin()` reports a tampered vault instead of a wrong
+        // password.
+        let mut e = crate::entry::Entry::new();
+        e.set(crate::entry::Field::Title, b"x");
+        v.add(&e).unwrap();
+        a.lock(&mut v);
+        // Slot 1 starts at the second flash sector; the version field is the
+        // third u32 of the header. Layout is a compatibility contract.
+        let off = crate::config::FLASH_SECTOR_BYTES + 4;
+        let mut byte = [0u8; 1];
+        v.storage_ref().read(off, &mut byte).unwrap();
+        byte[0] &= 0xFE;
+        v.storage_mut().write(off, &byte).unwrap();
+
+        let (id, req) = a.submit_unlock(&pw, &[]);
+        assert_ne!(id, NO_JOB);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Error);
+        let st = a.state();
+        assert_eq!(
+            st.fail_count, 0,
+            "a flash fault must not count as a failure"
+        );
+        assert_eq!(st.lockout_ms_left, 0);
+    }
+
+    /// The worker re-checks the vault state, because another job may have
+    /// changed it between the submit and the run.
+    #[test]
+    fn the_worker_refuses_a_provision_of_an_already_provisioned_vault() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let (id, req) = a.submit_provision(&[], false);
+        assert_ne!(id, NO_JOB);
+        // The vault becomes provisioned in between.
+        assert_eq!(
+            v.begin(PW, None, &mut CycleSource::new(SALT_BYTES)),
+            VaultError::None
+        );
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Refused);
+    }
+
+    #[test]
+    fn the_state_before_initialization_is_empty() {
+        let clock = ManualClock::new(0);
+        let a = auth(clock);
+        let st = a.state();
+        assert!(!st.provisioned);
+        assert!(!st.unlocked);
+        assert!(!st.busy);
+        assert_eq!(st.fail_count, 0);
+        assert_eq!(st.lockout_ms_left, 0);
+        assert!(a.session_token_hex().is_none());
+        assert!(!a.session_valid("00"));
+    }
+
+    #[test]
+    fn a_locked_session_accepts_no_token() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let _pw = provision(&mut a, &mut v);
+        let token = a.session_token_hex().unwrap();
+        assert!(a.session_valid(&token));
+        a.lock(&mut v);
+        assert!(!a.session_valid(&token));
+        assert!(a.session_token_hex().is_none());
+    }
+
+    #[test]
+    fn locking_wipes_a_pending_job_secret() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let (id, req) = a.submit_provision(&[], false);
+        a.run(&mut v, req.as_ref().unwrap());
+        // The password is in the slot but was never polled.
+        a.lock(&mut v);
+        let view = a.poll(id).unwrap();
+        assert!(
+            view.password.is_empty(),
+            "lock must wipe the pending secret"
+        );
+        assert!(view.session_token.is_empty());
+    }
+
+    #[test]
+    fn a_zero_ttl_expires_the_session_immediately() {
+        let clock = ManualClock::new(1_000);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let _pw = provision(&mut a, &mut v);
+        assert!(a.state().unlocked);
+        a.expire_idle_session(&mut v, 0);
+        assert!(!a.state().unlocked);
+    }
+
+    #[test]
+    fn the_session_survives_a_rekey() {
+        let clock = ManualClock::new(0);
+        let mut a = auth(clock);
+        let mut v = vault();
+        a.initialize(&v);
+        let pw = provision(&mut a, &mut v);
+        let token = a.session_token_hex().unwrap();
+        let (id, req) = a.submit_rekey(&pw, Some(PW2), &[], &[], KeyfileAction::Keep);
+        a.run(&mut v, req.as_ref().unwrap());
+        assert_eq!(a.poll(id).unwrap().result, JobResult::Ok);
+        assert!(a.state().unlocked);
+        assert!(a.session_valid(&token));
     }
 }

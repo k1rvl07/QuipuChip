@@ -842,7 +842,7 @@ fn ca_pem() -> Result<Outcome, HttpError> {
     Ok(Outcome::Download {
         body,
         content_type: "application/x-pem-file",
-        disposition: "attachment; filename=\"PassManager-CA.pem\"",
+        disposition: "attachment; filename=\"QuipuChip-CA.pem\"",
     })
 }
 
@@ -854,7 +854,7 @@ fn ca_der() -> Result<Outcome, HttpError> {
     Ok(Outcome::Download {
         body: der,
         content_type: "application/x-x509-ca-cert",
-        disposition: "attachment; filename=\"PassManager-CA.crt\"",
+        disposition: "attachment; filename=\"QuipuChip-CA.crt\"",
     })
 }
 

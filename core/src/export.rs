@@ -438,4 +438,124 @@ mod tests {
             ImportError::FormatRequired
         );
     }
+
+    #[test]
+    fn import_error_codes_are_the_wire_strings() {
+        // The HTTP layer returns these verbatim; the C++ handler used the same
+        // spellings, so they are a compatibility contract.
+        let cases = [
+            (ImportError::FormatRequired, "format_required"),
+            (ImportError::VersionUnsupported, "version_unsupported"),
+            (ImportError::EntriesRequired, "entries_required"),
+            (ImportError::NothingToImport, "nothing_to_import"),
+            (ImportError::BatchTooLarge, "batch_too_large"),
+            (ImportError::EntryNotAnObject, "entry_not_an_object"),
+            (
+                ImportError::FieldTooLongOrNotString,
+                "field_too_long_or_not_a_string",
+            ),
+            (ImportError::TotpSecretInvalid, "totp_secret_invalid"),
+            (ImportError::TotpParamsInvalid, "totp_params_invalid"),
+        ];
+        for (err, code) in cases {
+            assert_eq!(err.code(), code);
+            assert_eq!(err.to_string(), code);
+        }
+    }
+
+    #[test]
+    fn parse_import_bytes_accepts_a_valid_document() {
+        let doc = br#"{"format":"PMX1","version":1,"entries":[{"title":"T"}]}"#;
+        let entries = parse_import_bytes(doc).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].get_str(Field::Title).unwrap(), "T");
+    }
+
+    #[test]
+    fn export_head_and_tail_frame_the_document() {
+        let head = export_head(3);
+        assert_eq!(
+            head,
+            "{\"ok\":true,\"format\":\"PMX1\",\"version\":1,\"count\":3,\"entries\":["
+        );
+        assert_eq!(EXPORT_TAIL, "]}");
+        // The streamed form and the assembled form must agree.
+        let e = sample();
+        let mut streamed = export_head(1);
+        streamed.push_str(&encode_entry(&e));
+        streamed.push_str(EXPORT_TAIL);
+        assert_eq!(streamed, export_document(&[e]));
+    }
+
+    #[test]
+    fn an_empty_export_is_a_valid_document() {
+        let doc = export_document(&[]);
+        assert_eq!(
+            doc,
+            "{\"ok\":true,\"format\":\"PMX1\",\"version\":1,\"count\":0,\"entries\":[]}"
+        );
+        let value: Value = serde_json::from_str(&doc).unwrap();
+        // An empty document is refused on import: it would silently wipe
+        // nothing while claiming success.
+        assert_eq!(
+            parse_import(&value).unwrap_err(),
+            ImportError::NothingToImport
+        );
+    }
+
+    #[test]
+    fn into_entry_starts_from_id_zero() {
+        // The id is assigned by the vault on import, so a restore into another
+        // device never reuses foreign ids.
+        let p = Pmx1Entry {
+            title: "T".into(),
+            login: "L".into(),
+            password: "P".into(),
+            url: "U".into(),
+            note: "N".into(),
+            tags: "g".into(),
+            totp: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into(),
+            totp_digits: "8".into(),
+            totp_period: "60".into(),
+        };
+        let e = p.into_entry();
+        assert_eq!(e.id, 0);
+        assert_eq!(e.get_str(Field::Title).unwrap(), "T");
+        assert_eq!(e.get_str(Field::TotpDigits).unwrap(), "8");
+        assert_eq!(e.get_str(Field::TotpPeriod).unwrap(), "60");
+    }
+
+    #[test]
+    fn from_entry_and_into_entry_round_trip() {
+        let e = sample();
+        let back = Pmx1Entry::from_entry(&e).into_entry();
+        assert_eq!(back.get_str(Field::Title).unwrap(), "Mail");
+        assert_eq!(back.get_str(Field::Login).unwrap(), "user@example.com");
+        assert_eq!(back.get_str(Field::Password).unwrap(), "hunter2");
+        assert_eq!(
+            back.get_str(Field::Url).unwrap(),
+            "https://mail.example.com"
+        );
+        assert_eq!(back.get_str(Field::Note).unwrap(), "primary");
+        assert_eq!(back.get_str(Field::Tags).unwrap(), "work");
+        assert_eq!(
+            back.get_str(Field::Totp).unwrap(),
+            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+        );
+        assert_eq!(back.get_str(Field::TotpDigits).unwrap(), "8");
+        assert_eq!(back.get_str(Field::TotpPeriod).unwrap(), "60");
+    }
+
+    #[test]
+    fn a_null_totp_is_an_empty_totp() {
+        // `null` means "empty", not "invalid": a document written by an older
+        // exporter must still import.
+        let doc: Value = serde_json::json!({
+            "format": "PMX1",
+            "version": 1,
+            "entries": [{"title": "T", "totp": null}],
+        });
+        let back = parse_import(&doc).unwrap();
+        assert!(back[0].get(Field::Totp).is_empty());
+    }
 }

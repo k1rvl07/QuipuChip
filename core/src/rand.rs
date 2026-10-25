@@ -51,4 +51,25 @@ mod tests {
         s.fill(&mut buf);
         assert_eq!(buf, [1, 2, 3, 1, 2, 3, 1]);
     }
+
+    #[test]
+    fn cycle_source_keeps_its_position_across_fills() {
+        let mut s = CycleSource::new(&[1, 2, 3]);
+        let mut a = [0u8; 2];
+        s.fill(&mut a);
+        assert_eq!(a, [1, 2]);
+        let mut b = [0u8; 2];
+        s.fill(&mut b);
+        assert_eq!(b, [3, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty")]
+    fn cycle_source_refuses_an_empty_buffer() {
+        // An empty source would divide by zero in the wrap-around; the panic
+        // is a test-harness bug, not a device condition.
+        let mut s = CycleSource::new(&[]);
+        let mut buf = [0u8; 1];
+        s.fill(&mut buf);
+    }
 }

@@ -6,9 +6,9 @@
 //! IP, the port) stay in the firmware crate.
 
 /// Subject CN of the generated root CA.
-pub const TLS_CA_CN: &str = "PassManager CA";
+pub const TLS_CA_CN: &str = "QuipuChip CA";
 /// Subject CN of the generated server (leaf) certificate.
-pub const TLS_LEAF_CN: &str = "PassManager";
+pub const TLS_LEAF_CN: &str = "QuipuChip";
 /// Fixed `notBefore` (2020-01-01T00:00:00Z).
 ///
 /// The board has no RTC and never learns the wall clock, so the validity window

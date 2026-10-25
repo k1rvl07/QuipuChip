@@ -120,4 +120,34 @@ mod tests {
         assert!(decode("TW!u").is_none());
         assert!(decode("T===").is_none());
     }
+
+    #[test]
+    fn rejects_padding_in_the_wrong_place() {
+        // Padding may only appear in the last group, and only as "=" or "==".
+        assert!(decode("=AAA").is_none());
+        assert!(decode("A=AA").is_none());
+        assert!(decode("AA=A").is_none());
+        assert!(decode("A===").is_none());
+        assert!(decode("=AAA====").is_none());
+        // A group whose padding is only one '=' where two are needed is fine:
+        // "TQ==" is one byte.
+        assert_eq!(decode("TQ==").unwrap(), b"M");
+    }
+
+    #[test]
+    fn rejects_an_oversized_key_file() {
+        // The cap exists so a hostile client cannot make the device allocate an
+        // arbitrary buffer.
+        let big = encode(&vec![0u8; KEYFILE_MAX_BYTES + 1]);
+        assert!(decode(&big).is_none());
+        let at_limit = encode(&vec![0u8; KEYFILE_MAX_BYTES]);
+        assert_eq!(decode(&at_limit).unwrap().len(), KEYFILE_MAX_BYTES);
+    }
+
+    #[test]
+    fn rejects_whitespace_and_newlines() {
+        assert!(decode("TWFu\n").is_none());
+        assert!(decode("TW Fu").is_none());
+        assert!(decode("\n").is_none());
+    }
 }

@@ -78,58 +78,11 @@ const MIMES: &[(&str, &str)] = &[
 
 /// Maps a normalized path to its Content-Type, by extension.
 pub fn mime_for(path: &str) -> &'static str {
-    let Some((_, ext)) = path.rsplit_once('.') else {
-        return OCTET_STREAM;
-    };
-
-    for (name, ty) in MIMES {
-        if ext.eq_ignore_ascii_case(name) {
-            return ty;
-        }
-    }
-    OCTET_STREAM
+    pm_core::webpath::mime_for(path)
 }
 
-const OCTET_STREAM: &str = "application/octet-stream";
-
 /// Turns a request path into a bundle-relative name, or `None` if it must be
-/// rejected. Rules match the reference's `normalize`.
+/// rejected.
 fn normalize(rel: &str) -> Option<alloc::string::String> {
-    use alloc::string::String;
-
-    let path = rel.split('?').next().unwrap_or("");
-    let trimmed = path.trim_start_matches('/');
-    let path = if trimmed.is_empty() {
-        INDEX_FILE
-    } else {
-        trimmed
-    };
-
-    let mut out = String::with_capacity(path.len());
-    for seg in path.split('/') {
-        if seg == ".." {
-            return None;
-        }
-        // "." and empty segments (from repeated slashes) are dropped.
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push('/');
-        }
-        for &byte in seg.as_bytes() {
-            if byte < 0x20 || byte == 0x7F {
-                return None;
-            }
-        }
-        out.push_str(seg);
-        if out.len() + 1 > PATH_MAX {
-            return None;
-        }
-    }
-
-    if out.is_empty() {
-        return None;
-    }
-    Some(out)
+    pm_core::webpath::normalize(rel)
 }

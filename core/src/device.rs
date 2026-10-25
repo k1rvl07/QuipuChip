@@ -90,4 +90,55 @@ mod tests {
         assert_eq!(factor(&mac, &[]), Err(DeviceError::BadSalt));
         assert_eq!(factor(&mac, &[0u8; 17]), Err(DeviceError::BadSalt));
     }
+
+    #[test]
+    fn the_domain_label_is_fixed() {
+        // The label is MACed into the key; changing it would change every
+        // device factor and lock out every existing vault.
+        assert_eq!(DEVICE_LABEL, b"pm-vault-device");
+        assert_eq!(DEVICE_LABEL.len(), 15);
+    }
+
+    #[test]
+    fn a_full_length_salt_is_accepted() {
+        let mac = [0x44, 0x21, 0x5b, 0x5f, 0x0c, 0x7c];
+        assert!(factor(&mac, &[7u8; PBKDF2_SALT_LEN]).is_ok());
+        assert_eq!(
+            factor(&mac, &[7u8; PBKDF2_SALT_LEN + 1]),
+            Err(DeviceError::BadSalt)
+        );
+    }
+
+    #[test]
+    fn a_short_salt_changes_the_factor() {
+        // The salt length is part of the MACed message, so a shorter salt is a
+        // different factor rather than a padded one.
+        let mac = [0x44, 0x21, 0x5b, 0x5f, 0x0c, 0x7c];
+        let short = factor(&mac, &[1u8; 8]).unwrap();
+        let full = factor(&mac, &[1u8; 16]).unwrap();
+        assert!(!ct_equal(&short, &full));
+    }
+
+    #[test]
+    fn the_mac_order_is_the_reversed_efuse_order() {
+        // The C++ reference writes mac[i] = efuseMac >> ((5 - i) * 8), i.e. the
+        // canonical MAC 7c:0c:5f:5b:21:44 becomes 44 21 5b 5f 0c 7c.
+        let canonical = [0x7c, 0x0c, 0x5f, 0x5b, 0x21, 0x44];
+        let mut reversed = canonical;
+        reversed.reverse();
+        assert_eq!(reversed, [0x44, 0x21, 0x5b, 0x5f, 0x0c, 0x7c]);
+        // The factor depends on the order, so the two must not agree.
+        let a = factor(&reversed, &[1u8; 16]).unwrap();
+        let b = factor(&canonical, &[1u8; 16]).unwrap();
+        assert!(!ct_equal(&a, &b));
+    }
+
+    #[test]
+    fn device_error_messages() {
+        assert_eq!(DeviceError::NoMac.to_string(), "device MAC not available");
+        assert_eq!(
+            DeviceError::BadSalt.to_string(),
+            "invalid device salt length"
+        );
+    }
 }

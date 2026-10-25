@@ -1421,9 +1421,12 @@ fn derive_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::Field;
+    use crate::entry::{
+        ENTRY_LOGIN, ENTRY_NOTE, ENTRY_PASSWORD, ENTRY_PAYLOAD_MAX, ENTRY_TAGS, ENTRY_TITLE,
+        ENTRY_TOTP, ENTRY_TOTP_DIGITS, ENTRY_TOTP_PERIOD, ENTRY_URL, Field,
+    };
     use crate::rand::CycleSource;
-    use crate::testutil::vault;
+    use crate::testutil::{MemStorage, vault};
 
     const SALT_BYTES: &[u8] = b"deterministic-salt-material-0123456789";
     const PW: &str = "correct horse battery staple";
@@ -1634,5 +1637,284 @@ mod tests {
         }
         assert_eq!(v.load(3).unwrap().len(), 3);
         assert_eq!(v.load(100).unwrap().len(), 5);
+    }
+
+    // ── Uncovered branches ───────────────────────────────────────────────────
+
+    /// A vault that was never opened refuses every operation. The device must
+    /// not hand out a stale or empty record set in this state.
+    #[test]
+    fn operations_on_a_locked_vault_report_bootstrap() {
+        let mut v = vault();
+        assert_eq!(v.get(1), Err(VaultError::BootStrap));
+        assert_eq!(v.load(10), Err(VaultError::BootStrap));
+        assert_eq!(v.add(&entry("A", "pw")), Err(VaultError::BootStrap));
+        assert_eq!(v.remove(1), VaultError::BootStrap);
+
+        // The same holds after a successful session is closed.
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("A", "pw")).unwrap();
+        v.close();
+        assert_eq!(v.get(1), Err(VaultError::BootStrap));
+        assert_eq!(v.load(10), Err(VaultError::BootStrap));
+        assert_eq!(v.add(&entry("A", "pw")), Err(VaultError::BootStrap));
+        assert_eq!(v.remove(1), VaultError::BootStrap);
+    }
+
+    #[test]
+    fn removing_an_unknown_id_reports_not_found() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        assert_eq!(v.remove(4242), VaultError::NotFound);
+        let id = v.add(&entry("A", "pw")).unwrap();
+        assert_eq!(v.remove(id), VaultError::None);
+        assert_eq!(v.remove(id), VaultError::NotFound);
+    }
+
+    #[test]
+    fn a_password_outside_the_length_range_is_refused() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.close();
+        // Too short and too long are both refused before any KDF work.
+        assert_eq!(
+            v.begin("short", None, &mut rng()),
+            VaultError::WrongPassword
+        );
+        let too_long = "x".repeat(MAX_PASS_CHARS);
+        assert_eq!(
+            v.begin(&too_long, None, &mut rng()),
+            VaultError::WrongPassword
+        );
+        // The vault stays provisioned and locked, never Unprovisioned: a bad
+        // password must not look like a factory-fresh device.
+        assert!(v.provisioned());
+        assert_eq!(v.snapshot().state, State::Locked);
+    }
+
+    /// `EntryTooLong` cannot be produced by `add`: the record fields are
+    /// fixed-capacity and their total is smaller than the record limit. The
+    /// branch exists, but this test pins why it stays unreachable -- if the
+    /// fields ever grow past `MAX_ENTRY_LEN`, this assertion fails.
+    #[test]
+    fn the_entry_payload_always_fits_the_record_limit() {
+        const { assert!(ENTRY_PAYLOAD_MAX <= MAX_ENTRY_LEN) };
+        let mut e = Entry::new();
+        e.set(Field::Title, &[b'T'; ENTRY_TITLE]);
+        e.set(Field::Login, &[b'L'; ENTRY_LOGIN]);
+        e.set(Field::Password, &[b'P'; ENTRY_PASSWORD]);
+        e.set(Field::Url, &[b'U'; ENTRY_URL]);
+        e.set(Field::Note, &[b'N'; ENTRY_NOTE]);
+        e.set(Field::Tags, &[b'G'; ENTRY_TAGS]);
+        e.set(Field::Totp, &[b'T'; ENTRY_TOTP]);
+        e.set(Field::TotpDigits, &[b'8'; ENTRY_TOTP_DIGITS]);
+        e.set(Field::TotpPeriod, &[b'6'; ENTRY_TOTP_PERIOD]);
+        let mut buf = vec![0u8; MAX_ENTRY_LEN];
+        let n = e.serialize(&mut buf).expect("a maxed-out entry fits");
+        assert!(n <= MAX_ENTRY_LEN);
+    }
+
+    #[test]
+    fn the_live_byte_budget_is_enforced() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        let big = vec![b'x'; ENTRY_NOTE - 1];
+        let mut last = VaultError::None;
+        let mut added = 0u32;
+        loop {
+            let mut e = entry("bulk", "password");
+            e.set(Field::Note, &big);
+            match v.add(&e) {
+                Ok(_) => added += 1,
+                Err(err) => {
+                    last = err;
+                    break;
+                }
+            }
+            if added > 1000 {
+                break;
+            }
+        }
+        assert_eq!(last, VaultError::Budget);
+        assert!(added > 0, "the budget must be reachable");
+        // The vault is still consistent: the refused write changed nothing.
+        assert_eq!(v.count(), added);
+        assert!(v.stats().live_bytes <= VAULT_LIVE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn the_entry_count_limit_is_enforced() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        for i in 0..MAX_ENTRIES {
+            v.add(&entry("x", "pw"))
+                .unwrap_or_else(|e| panic!("add #{i} failed: {e:?}"));
+        }
+        assert_eq!(v.count(), MAX_ENTRIES);
+        assert_eq!(v.add(&entry("x", "pw")), Err(VaultError::TooManyEntries));
+        // Updating an existing record is still allowed at the limit.
+        let mut e = entry("x", "pw2");
+        e.id = 1;
+        assert_eq!(v.add(&e), Ok(1));
+    }
+
+    /// A header whose entry count does not match the journal is refused. The
+    /// counters are not part of the AAD, so the tag stays valid -- they are
+    /// protected by recomputing them from the journal instead.
+    #[test]
+    fn a_tampered_entry_count_is_caught_by_the_recomputation() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("Mail", "secret")).unwrap();
+        v.close();
+
+        // Slot 1 is the newest one (seq 1). Its tag is still valid, because
+        // the counters are excluded from the AAD.
+        let off = HDR_SLOT1 + HDR_ENTRY_COUNT;
+        let mut buf = [0u8; 4];
+        v.storage_ref().read(off, &mut buf).unwrap();
+        // Flash can only clear bits, so the count is zeroed, not set to 99.
+        put32(&mut buf, 0);
+        v.storage_mut().write(off, &buf).unwrap();
+
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::Tampered);
+    }
+
+    /// A header interrupted before its completion marker is treated as a torn
+    /// write: the backup slot takes over. The rollback is safe because the
+    /// journal state it describes is the one before the interrupted write.
+    #[test]
+    fn a_torn_newest_header_falls_back_to_the_backup_slot() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("Mail", "secret")).unwrap();
+        v.close();
+
+        // Clear a bit in the commit marker of the newest slot: the write was
+        // interrupted, the record it described was never acknowledged.
+        let off = HDR_SLOT1 + HDR_COMMIT;
+        let mut byte = [0u8; 1];
+        v.storage_ref().read(off, &mut byte).unwrap();
+        byte[0] &= 0xFE;
+        v.storage_mut().write(off, &byte).unwrap();
+
+        // The backup slot (the provisioning header) is used, so the vault opens
+        // with the state from before the interrupted write: the record that
+        // was written but never acknowledged is not visible.
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        assert_eq!(v.count(), 0);
+        // The journal is rebuilt, because the unacknowledged record left a
+        // dirty tail behind the rolled-back `usedBytes`.
+        assert!(v.stats().compacted_once);
+        // The vault is usable afterwards.
+        let id = v.add(&entry("After", "pw")).unwrap();
+        assert_eq!(v.get(id).unwrap().get(Field::Title), b"After");
+    }
+
+    /// A corrupted fresh header must NOT be mistaken for an interrupted write
+    /// and silently rolled back: the older slot is a forgery target, and
+    /// returning stale data instead of refusing is data loss.
+    #[test]
+    fn a_corrupted_newest_header_is_not_silently_rolled_back() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("Mail", "secret")).unwrap();
+        v.close();
+
+        // Damage the tag of the newest slot: the header is complete but does
+        // not authenticate.
+        let off = HDR_SLOT1 + HDR_CHECK;
+        let mut byte = [0u8; 1];
+        v.storage_ref().read(off, &mut byte).unwrap();
+        byte[0] ^= 0x01;
+        v.storage_mut().write(off, &byte).unwrap();
+
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::WrongPassword);
+    }
+
+    /// The backup slot being damaged does not stop the vault from opening: the
+    /// fresh slot authenticates on its own.
+    #[test]
+    fn a_damaged_backup_slot_does_not_block_the_fresh_one() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("Mail", "secret")).unwrap();
+        v.close();
+
+        let off = HDR_SLOT0 + HDR_VERSION;
+        let mut byte = [0u8; 1];
+        v.storage_ref().read(off, &mut byte).unwrap();
+        byte[0] &= 0xFE;
+        v.storage_mut().write(off, &byte).unwrap();
+
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        assert_eq!(v.count(), 1);
+    }
+
+    /// `provisioned()` must answer before the first `begin()`: the HTTP layer
+    /// asks for the state on a cold start, where nobody has opened the vault.
+    #[test]
+    fn provisioned_is_known_before_the_first_begin() {
+        let mut v = vault();
+        assert!(!v.provisioned());
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("Mail", "secret")).unwrap();
+        v.close();
+
+        // A fresh vault object over the same flash content. `initialize()` is
+        // what the firmware calls at boot: it reads the provisioned flag off
+        // the flash and publishes it, without any password.
+        let image = v.storage_ref().to_bytes();
+        let mut fresh = Vault::new(MemStorage::from_bytes(image), crate::testutil::TEST_MAC);
+        fresh.initialize();
+        assert!(fresh.provisioned());
+        assert_eq!(fresh.snapshot().state, State::Locked);
+        assert_eq!(fresh.count(), 0);
+        // The key-file flag is read from the flash as well.
+        assert!(!fresh.key_file_required());
+    }
+
+    /// The key-file flag survives a reboot and is visible before `begin()`.
+    #[test]
+    fn the_key_file_flag_survives_a_reboot() {
+        let mut v = vault();
+        let kf = b"super-secret-key-file";
+        assert_eq!(v.begin(PW, Some(kf), &mut rng()), VaultError::None);
+        v.close();
+
+        let image = v.storage_ref().to_bytes();
+        let mut fresh = Vault::new(MemStorage::from_bytes(image), crate::testutil::TEST_MAC);
+        assert!(fresh.key_file_required());
+        // And the vault still refuses to open without the file.
+        assert_eq!(fresh.begin(PW, None, &mut rng()), VaultError::WrongPassword);
+    }
+
+    /// A reboot with the same flash content must open the same vault: the
+    /// header, the salts and the journal all live in the partition.
+    #[test]
+    fn a_reboot_opens_the_same_vault() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        let id = v.add(&entry("Mail", "secret")).unwrap();
+        let image = v.storage_ref().to_bytes();
+
+        let mut fresh = Vault::new(MemStorage::from_bytes(image), crate::testutil::TEST_MAC);
+        assert_eq!(fresh.begin(PW, None, &mut rng()), VaultError::None);
+        assert_eq!(fresh.count(), 1);
+        assert_eq!(fresh.get(id).unwrap().get(Field::Password), b"secret");
+    }
+
+    /// The vault is bound to the device: the same flash content opened with a
+    /// different MAC must not decrypt.
+    #[test]
+    fn another_mac_cannot_open_the_vault() {
+        let mut v = vault();
+        assert_eq!(v.begin(PW, None, &mut rng()), VaultError::None);
+        v.add(&entry("Mail", "secret")).unwrap();
+        v.close();
+        let image = v.storage_ref().to_bytes();
+
+        let mut other = Vault::new(MemStorage::from_bytes(image), [0xAA; 6]);
+        assert_eq!(other.begin(PW, None, &mut rng()), VaultError::WrongPassword);
     }
 }

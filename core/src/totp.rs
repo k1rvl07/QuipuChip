@@ -258,4 +258,86 @@ mod tests {
         assert_eq!(decode_base32(b"B", &mut out), None);
         assert_eq!(decode_base32(b"B=======", &mut out), None);
     }
+
+    #[test]
+    fn decode_base32_accepts_lowercase_and_padding() {
+        let mut out = [0u8; 16];
+        // "MZXW6===" -> "foo".
+        assert_eq!(decode_base32(b"MZXW6===", &mut out), Some(3));
+        assert_eq!(&out[..3], b"foo");
+        // The same secret in lower case must decode identically.
+        assert_eq!(decode_base32(b"mzxw6===", &mut out), Some(3));
+        assert_eq!(&out[..3], b"foo");
+        // Padding is optional.
+        assert_eq!(decode_base32(b"MZXW6", &mut out), Some(3));
+    }
+
+    #[test]
+    fn decode_base32_rejects_an_empty_secret_and_a_short_output() {
+        let mut out = [0u8; 16];
+        assert_eq!(decode_base32(b"", &mut out), None);
+        assert_eq!(decode_base32(b"====", &mut out), None);
+        // 20 base32 chars decode to 12 bytes; a 4-byte buffer must be refused
+        // rather than truncated.
+        let mut small = [0u8; 4];
+        assert_eq!(
+            decode_base32(b"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", &mut small),
+            None
+        );
+    }
+
+    #[test]
+    fn secret_length_boundaries() {
+        // The reference accepts 16..TOTP_SECRET_MAX-1 characters.
+        let short = "GEZDGNBVGY3TQOJQ"; // 16 chars -> 10 bytes
+        assert!(is_valid_secret(short));
+        assert!(!is_valid_secret(&short[..15]));
+        // TOTP_SECRET_MAX characters is one too many; one below is fine.
+        let at_limit = "A".repeat(TOTP_SECRET_MAX - 1);
+        assert!(is_valid_secret(&at_limit));
+        let too_long = "A".repeat(TOTP_SECRET_MAX);
+        assert!(!is_valid_secret(&too_long));
+    }
+
+    #[test]
+    fn compute_rejects_a_short_decoded_secret() {
+        // 16 base32 characters decode to 10 bytes, which is the minimum; a
+        // shorter secret must be refused even if it is well-formed base32.
+        assert_eq!(
+            compute("GEZDGNBVGY3TQO", 59, TOTP_DIGITS, TOTP_PERIOD_SEC),
+            Err(TotpError::BadSecret)
+        );
+    }
+
+    #[test]
+    fn codes_are_zero_padded_to_the_requested_width() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        // RFC 6238 vector 1111111109 -> "081804" with six digits: the leading
+        // zero is part of the code, not an accident.
+        let code = compute(secret, 1_111_111_109, TOTP_DIGITS, TOTP_PERIOD_SEC).unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.starts_with('0'));
+    }
+
+    #[test]
+    fn a_code_is_stable_inside_its_time_step_and_changes_across_it() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let period = TOTP_PERIOD_SEC;
+        let base = 1_234_567_890u64;
+        let a = compute(secret, base, TOTP_DIGITS, period).unwrap();
+        let b = compute(secret, base + period - 1, TOTP_DIGITS, period).unwrap();
+        let c = compute(secret, base + period, TOTP_DIGITS, period).unwrap();
+        assert_eq!(a, b, "the code must not change inside a step");
+        assert_ne!(a, c, "the code must change at a step boundary");
+    }
+
+    #[test]
+    fn resolve_rejects_non_numeric_and_overflowing_values() {
+        assert_eq!(resolve_digits(b" 6"), None);
+        assert_eq!(resolve_digits(b"+6"), None);
+        assert_eq!(resolve_digits(b"18446744073709551616"), None);
+        assert_eq!(resolve_period(b"18446744073709551616"), None);
+        assert_eq!(resolve_digits(b"6"), Some(6));
+        assert_eq!(resolve_period(b"10"), Some(10));
+    }
 }
